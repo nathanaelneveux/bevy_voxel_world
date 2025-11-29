@@ -325,8 +325,7 @@ where
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_despawn: MessageWriter<ChunkWillDespawn<C>>,
     ) {
-        let max_despawns = configuration.max_chunk_despawns_per_frame();
-        if max_despawns == 0 {
+        if configuration.max_chunk_despawns_per_frame() == 0 {
             return;
         }
 
@@ -341,8 +340,6 @@ where
         let near_distance_squared =
             (CHUNK_SIZE_I * configuration.min_despawn_distance() as i32).pow(2);
         let strategy = configuration.chunk_despawn_strategy();
-
-        let mut retired = 0usize;
 
         for (chunk, view_visibility) in all_chunks.iter() {
             let should_be_culled = match strategy {
@@ -366,10 +363,6 @@ where
                 commands.entity(chunk.entity).try_insert(NeedsDespawn);
                 ev_chunk_will_despawn
                     .write(ChunkWillDespawn::<C>::new(chunk.position, chunk.entity));
-                retired += 1;
-                if retired >= max_despawns {
-                    break;
-                }
             }
         }
     }
@@ -379,16 +372,28 @@ where
         mut commands: Commands,
         mut chunk_map_remove_buffer: ResMut<ChunkMapRemoveBuffer<C>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
+        configuration: Res<C>,
         retired_chunks: Query<(Entity, &Chunk<C>), With<NeedsDespawn>>,
     ) {
+        let max_despawns = configuration.max_chunk_despawns_per_frame();
+        if max_despawns == 0 {
+            return;
+        }
+
         let read_lock = chunk_map.get_read_lock();
+        let mut retired = 0usize;
         for (entity, chunk) in retired_chunks.iter() {
+            if retired >= max_despawns {
+                break;
+            }
+
             if ChunkMap::<C, C::MaterialIndex>::contains_chunk(
                 &chunk.position,
                 &read_lock,
             ) {
                 commands.entity(entity).despawn();
                 chunk_map_remove_buffer.push(chunk.position);
+                retired += 1;
             }
         }
     }
