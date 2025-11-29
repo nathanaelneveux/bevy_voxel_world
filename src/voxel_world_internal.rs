@@ -66,6 +66,8 @@ pub(crate) struct NeedsMaterial<C>(PhantomData<C>);
 #[derive(Resource, Default)]
 pub struct ChunkRetireTaskState<C: VoxelWorldConfig> {
     pending: Vec<Task<Vec<ChunkRetireDecision>>>,
+    queued: VecDeque<ChunkRetireDecision>,
+    enqueued: HashSet<Entity>,
     _marker: PhantomData<C>,
 }
 
@@ -79,7 +81,6 @@ struct ChunkRetireCandidate {
 #[derive(Clone, Copy)]
 struct ChunkRetireDecision {
     entity: Entity,
-    position: IVec3,
 }
 
 pub(crate) struct Internals<C>(PhantomData<C>);
@@ -351,158 +352,208 @@ where
         };
 
         let max_threads = configuration.max_chunk_retire_threads();
+        let cam_pos = cam_gtf.translation().as_ivec3();
+        let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
+        let spawning_distance = configuration.spawning_distance() as i32;
+        let spawning_distance_squared = spawning_distance.pow(2);
+        let near_distance_squared =
+            (CHUNK_SIZE_I * configuration.min_despawn_distance() as i32).pow(2);
+        let strategy = configuration.chunk_despawn_strategy();
+        let max_despawns = configuration.max_chunk_despawns_per_frame();
 
-        Self::flush_completed_retire_tasks(
-            &mut commands,
-            &mut retire_tasks,
-            &mut ev_chunk_will_despawn,
-        );
+        Self::flush_completed_retire_tasks(&mut retire_tasks);
 
         if max_threads == 0 {
             retire_tasks.pending.clear();
             Self::retire_chunks_single_thread(
-                &mut commands,
+                &mut retire_tasks,
                 &all_chunks,
-                configuration.as_ref(),
                 camera,
                 cam_gtf,
-                &mut ev_chunk_will_despawn,
+                chunk_at_camera,
+                spawning_distance_squared,
+                near_distance_squared,
+                strategy,
             );
-            return;
-        }
+        } else if retire_tasks.pending.is_empty() {
+            let mut candidates = Vec::with_capacity(all_chunks.iter().len());
+            for (entity, chunk, view_visibility) in all_chunks.iter() {
+                candidates.push(ChunkRetireCandidate {
+                    entity,
+                    position: chunk.position,
+                    view_visible: view_visibility.map(|vis| vis.get()),
+                });
+            }
 
-        if !retire_tasks.pending.is_empty() {
-            return;
-        }
+            if !candidates.is_empty() {
+                let task_count = candidates.len().min(max_threads);
+                if task_count > 0 {
+                    let slices_per_task =
+                        (candidates.len() + task_count - 1) / task_count;
+                    let camera = camera.clone();
+                    let cam_transform = *cam_gtf;
+                    let thread_pool = AsyncComputeTaskPool::get();
 
-        let cam_pos = cam_gtf.translation().as_ivec3();
-        let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
-        let spawning_distance = configuration.spawning_distance() as i32;
-        let spawning_distance_squared = spawning_distance.pow(2);
-        let near_distance_squared =
-            (CHUNK_SIZE_I * configuration.min_despawn_distance() as i32).pow(2);
-        let strategy = configuration.chunk_despawn_strategy();
-
-        let mut candidates = Vec::with_capacity(all_chunks.iter().len());
-        for (entity, chunk, view_visibility) in all_chunks.iter() {
-            candidates.push(ChunkRetireCandidate {
-                entity,
-                position: chunk.position,
-                view_visible: view_visibility.map(|vis| vis.get()),
-            });
-        }
-
-        if candidates.is_empty() {
-            return;
-        }
-
-        let task_count = candidates.len().min(max_threads);
-        if task_count == 0 {
-            return;
-        }
-
-        let slices_per_task = (candidates.len() + task_count - 1) / task_count;
-        let camera = camera.clone();
-        let cam_transform = *cam_gtf;
-        let thread_pool = AsyncComputeTaskPool::get();
-
-        for chunk_slice in candidates
-            .chunks(slices_per_task)
-            .take(task_count)
-            .map(|chunk| chunk.to_vec())
-        {
-            let camera = camera.clone();
-            retire_tasks.pending.push(thread_pool.spawn(async move {
-                compute_chunk_retirements(
-                    chunk_slice,
-                    chunk_at_camera,
-                    strategy,
-                    camera,
-                    cam_transform,
-                    spawning_distance_squared,
-                    near_distance_squared,
-                )
-            }));
-        }
-    }
-
-    fn retire_chunks_single_thread(
-        commands: &mut Commands,
-        all_chunks: &Query<(Entity, &Chunk<C>, Option<&ViewVisibility>)>,
-        configuration: &C,
-        camera: &Camera,
-        cam_gtf: &GlobalTransform,
-        ev_chunk_will_despawn: &mut MessageWriter<ChunkWillDespawn<C>>,
-    ) {
-        let spawning_distance = configuration.spawning_distance() as i32;
-        let spawning_distance_squared = spawning_distance.pow(2);
-        let cam_pos = cam_gtf.translation().as_ivec3();
-        let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
-        let near_distance_squared =
-            (CHUNK_SIZE_I * configuration.min_despawn_distance() as i32).pow(2);
-        let strategy = configuration.chunk_despawn_strategy();
-
-        let mut remove = Vec::with_capacity(1000);
-        for (entity, chunk, view_visibility) in all_chunks.iter() {
-            let should_be_culled = match strategy {
-                ChunkDespawnStrategy::FarAway => false,
-                ChunkDespawnStrategy::FarAwayOrOutOfView => {
-                    let frustum_culled =
-                        !chunk_visible_to_camera(camera, cam_gtf, chunk.position, 0.0);
-                    if let Some(visibility) = view_visibility {
-                        !visibility.get() || frustum_culled
-                    } else {
-                        frustum_culled
+                    for chunk_slice in candidates
+                        .chunks(slices_per_task)
+                        .take(task_count)
+                        .map(|chunk| chunk.to_vec())
+                    {
+                        let camera = camera.clone();
+                        retire_tasks.pending.push(thread_pool.spawn(async move {
+                            compute_chunk_retirements(
+                                chunk_slice,
+                                chunk_at_camera,
+                                strategy,
+                                camera,
+                                cam_transform,
+                                spawning_distance_squared,
+                                near_distance_squared,
+                            )
+                        }));
                     }
                 }
-            };
-            let dist_squared = chunk.position.distance_squared(chunk_at_camera);
-            let near_camera = dist_squared <= near_distance_squared;
-            if (should_be_culled && !near_camera)
-                || dist_squared > spawning_distance_squared + 1
-            {
-                remove.push((entity, chunk.position));
             }
         }
 
-        let decisions = remove
-            .into_iter()
-            .map(|(entity, position)| ChunkRetireDecision { entity, position });
-        Self::apply_retire_decisions(commands, ev_chunk_will_despawn, decisions);
+        Self::apply_queued_retire_decisions(
+            &mut commands,
+            &all_chunks,
+            &mut retire_tasks,
+            &mut ev_chunk_will_despawn,
+            camera,
+            cam_gtf,
+            chunk_at_camera,
+            spawning_distance_squared,
+            near_distance_squared,
+            strategy,
+            max_despawns,
+        );
     }
 
-    fn flush_completed_retire_tasks(
-        commands: &mut Commands,
+    fn retire_chunks_single_thread(
         retire_tasks: &mut ChunkRetireTaskState<C>,
-        ev_chunk_will_despawn: &mut MessageWriter<ChunkWillDespawn<C>>,
+        all_chunks: &Query<(Entity, &Chunk<C>, Option<&ViewVisibility>)>,
+        camera: &Camera,
+        cam_gtf: &GlobalTransform,
+        chunk_at_camera: IVec3,
+        spawning_distance_squared: i32,
+        near_distance_squared: i32,
+        strategy: ChunkDespawnStrategy,
     ) {
+        for (entity, chunk, view_visibility) in all_chunks.iter() {
+            if chunk_should_retire(
+                strategy,
+                camera,
+                cam_gtf,
+                chunk.position,
+                chunk_at_camera,
+                view_visibility.map(|vis| vis.get()),
+                spawning_distance_squared,
+                near_distance_squared,
+            ) {
+                Self::queue_retire_decision(retire_tasks, ChunkRetireDecision { entity });
+            }
+        }
+    }
+
+    fn flush_completed_retire_tasks(retire_tasks: &mut ChunkRetireTaskState<C>) {
         let mut still_running = Vec::new();
+        let mut finished = Vec::new();
         for mut task in retire_tasks.pending.drain(..) {
             if let Some(decisions) = future::block_on(future::poll_once(&mut task)) {
-                Self::apply_retire_decisions(commands, ev_chunk_will_despawn, decisions);
+                finished.push(decisions);
             } else {
                 still_running.push(task);
             }
         }
         retire_tasks.pending = still_running;
+
+        for decisions in finished {
+            Self::queue_retire_decisions(retire_tasks, decisions);
+        }
     }
 
-    fn apply_retire_decisions<I>(
-        commands: &mut Commands,
-        ev_chunk_will_despawn: &mut MessageWriter<ChunkWillDespawn<C>>,
-        decisions: I,
-    ) where
+    fn queue_retire_decision(
+        retire_tasks: &mut ChunkRetireTaskState<C>,
+        decision: ChunkRetireDecision,
+    ) {
+        if retire_tasks.enqueued.insert(decision.entity) {
+            retire_tasks.queued.push_back(decision);
+        }
+    }
+
+    fn queue_retire_decisions<I>(retire_tasks: &mut ChunkRetireTaskState<C>, decisions: I)
+    where
         I: IntoIterator<Item = ChunkRetireDecision>,
     {
         for decision in decisions {
-            if let Ok(mut entity_commands) = commands.get_entity(decision.entity) {
-                entity_commands.try_insert(NeedsDespawn);
-                ev_chunk_will_despawn.write(ChunkWillDespawn::<C>::new(
-                    decision.position,
-                    decision.entity,
-                ));
-            }
+            Self::queue_retire_decision(retire_tasks, decision);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_queued_retire_decisions(
+        commands: &mut Commands,
+        all_chunks: &Query<(Entity, &Chunk<C>, Option<&ViewVisibility>)>,
+        retire_tasks: &mut ChunkRetireTaskState<C>,
+        ev_chunk_will_despawn: &mut MessageWriter<ChunkWillDespawn<C>>,
+        camera: &Camera,
+        cam_gtf: &GlobalTransform,
+        chunk_at_camera: IVec3,
+        spawning_distance_squared: i32,
+        near_distance_squared: i32,
+        strategy: ChunkDespawnStrategy,
+        max_despawns: usize,
+    ) {
+        if max_despawns == 0 || retire_tasks.queued.is_empty() {
+            return;
+        }
+
+        let mut applied = 0usize;
+        let mut remaining = VecDeque::new();
+
+        while let Some(decision) = retire_tasks.queued.pop_front() {
+            if applied >= max_despawns {
+                remaining.push_back(decision);
+                remaining.extend(retire_tasks.queued.drain(..));
+                break;
+            }
+
+            let Ok((_, chunk, view_visibility)) = all_chunks.get(decision.entity) else {
+                retire_tasks.enqueued.remove(&decision.entity);
+                continue;
+            };
+
+            let view_visible = view_visibility.map(|vis| vis.get());
+            if chunk_should_retire(
+                strategy,
+                camera,
+                cam_gtf,
+                chunk.position,
+                chunk_at_camera,
+                view_visible,
+                spawning_distance_squared,
+                near_distance_squared,
+            ) {
+                if let Ok(mut entity_commands) = commands.get_entity(decision.entity) {
+                    entity_commands.try_insert(NeedsDespawn);
+                    ev_chunk_will_despawn.write(ChunkWillDespawn::<C>::new(
+                        chunk.position,
+                        decision.entity,
+                    ));
+                }
+                applied += 1;
+            }
+
+            retire_tasks.enqueued.remove(&decision.entity);
+        }
+
+        if !retire_tasks.queued.is_empty() {
+            remaining.extend(retire_tasks.queued.drain(..));
+        }
+
+        retire_tasks.queued = remaining;
     }
 
     /// Despawns chunks that have been tagged for despawning
@@ -819,38 +870,53 @@ fn compute_chunk_retirements(
     candidates
         .into_iter()
         .filter_map(|candidate| {
-            let should_be_culled = match strategy {
-                ChunkDespawnStrategy::FarAway => false,
-                ChunkDespawnStrategy::FarAwayOrOutOfView => {
-                    let frustum_culled = !chunk_visible_to_camera(
-                        &camera,
-                        &cam_transform,
-                        candidate.position,
-                        0.0,
-                    );
-                    if let Some(visible) = candidate.view_visible {
-                        !visible || frustum_culled
-                    } else {
-                        frustum_culled
-                    }
-                }
-            };
-
-            let dist_squared = candidate.position.distance_squared(chunk_at_camera);
-            let near_camera = dist_squared <= near_distance_squared;
-
-            if (should_be_culled && !near_camera)
-                || dist_squared > spawning_distance_squared + 1
-            {
+            if chunk_should_retire(
+                strategy,
+                &camera,
+                &cam_transform,
+                candidate.position,
+                chunk_at_camera,
+                candidate.view_visible,
+                spawning_distance_squared,
+                near_distance_squared,
+            ) {
                 Some(ChunkRetireDecision {
                     entity: candidate.entity,
-                    position: candidate.position,
                 })
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn chunk_should_retire(
+    strategy: ChunkDespawnStrategy,
+    camera: &Camera,
+    cam_transform: &GlobalTransform,
+    chunk_position: IVec3,
+    chunk_at_camera: IVec3,
+    view_visible: Option<bool>,
+    spawning_distance_squared: i32,
+    near_distance_squared: i32,
+) -> bool {
+    let should_be_culled = match strategy {
+        ChunkDespawnStrategy::FarAway => false,
+        ChunkDespawnStrategy::FarAwayOrOutOfView => {
+            let frustum_culled =
+                !chunk_visible_to_camera(camera, cam_transform, chunk_position, 0.0);
+            if let Some(visible) = view_visible {
+                !visible || frustum_culled
+            } else {
+                frustum_culled
+            }
+        }
+    };
+
+    let dist_squared = chunk_position.distance_squared(chunk_at_camera);
+    let near_camera = dist_squared <= near_distance_squared;
+
+    (should_be_culled && !near_camera) || dist_squared > spawning_distance_squared + 1
 }
 
 fn chunk_visible_to_camera(
