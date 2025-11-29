@@ -63,7 +63,7 @@ pub enum ChunkRegenerateStrategy {
     Repopulate,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
 pub enum ChunkDespawnStrategy {
     /// Despawn chunks that are further than `spawning_distance` away from the camera
     /// or outside of the viewport.
@@ -74,7 +74,7 @@ pub enum ChunkDespawnStrategy {
     FarAway,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
 pub enum ChunkSpawnStrategy {
     /// Spawn chunks that are within `spawning_distance` of the camera
     /// and also inside the viewport.
@@ -119,6 +119,15 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     /// This is only used if the despawn strategy is `FarAway`
     fn chunk_spawn_strategy(&self) -> ChunkSpawnStrategy {
         ChunkSpawnStrategy::default()
+    }
+
+    /// Maximum number of async chunk retirement tasks that may run concurrently.
+    ///
+    /// Set this to `0` to keep retire/despawn checks on the main thread.
+    /// Increasing it offloads the work to async compute workers, similarly to
+    /// [`max_active_chunk_threads`], which helps when evaluating large worlds.
+    fn max_chunk_retire_threads(&self) -> usize {
+        0
     }
 
     /// Maximum number of chunks that can get queued for spawning in a given frame.
