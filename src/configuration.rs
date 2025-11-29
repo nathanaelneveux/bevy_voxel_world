@@ -121,15 +121,6 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
         ChunkSpawnStrategy::default()
     }
 
-    /// Maximum number of async chunk retirement tasks that may run concurrently.
-    ///
-    /// Set this to `0` to keep retire/despawn checks on the main thread.
-    /// Increasing it offloads the work to async compute workers, similarly to
-    /// [`max_active_chunk_threads`], which helps when evaluating large worlds.
-    fn max_chunk_retire_threads(&self) -> usize {
-        0
-    }
-
     /// Maximum number of chunks that can be tagged for despawning in a single frame.
     ///
     /// Set this to `0` to pause retire/despawn work temporarily. The default allows
