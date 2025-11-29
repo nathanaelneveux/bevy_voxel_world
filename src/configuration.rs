@@ -130,6 +130,14 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
         0
     }
 
+    /// Maximum number of chunks that can be tagged for despawning in a single frame.
+    ///
+    /// Set this to `0` to pause retire/despawn work temporarily. The default allows
+    /// unlimited chunk retirements per frame.
+    fn max_chunk_despawns_per_frame(&self) -> usize {
+        usize::MAX
+    }
+
     /// Maximum number of chunks that can get queued for spawning in a given frame.
     /// In some scenarios, reducing this number can help with performance, due to less
     /// thread contention.
