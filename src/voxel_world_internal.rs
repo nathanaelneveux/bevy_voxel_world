@@ -674,6 +674,10 @@ where
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         modified_voxels: ResMut<ModifiedVoxels<C, C::MaterialIndex>>,
     ) {
+        if buffer.is_empty() {
+            return;
+        }
+        
         let chunk_map_read_lock = chunk_map.get_read_lock();
         let mut modified_voxels = modified_voxels.write().unwrap();
 
