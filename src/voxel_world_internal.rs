@@ -340,7 +340,7 @@ where
     /// Tags chunks that are eligible for despawning
     pub fn retire_chunks(
         mut commands: Commands,
-        all_chunks: Query<(&Chunk<C>, Option<&ViewVisibility>)>,
+        all_chunks: Query<(&Chunk<C>, Option<&ViewVisibility>), Without<NeedsDespawn>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_despawn: MessageWriter<ChunkWillDespawn<C>>,
