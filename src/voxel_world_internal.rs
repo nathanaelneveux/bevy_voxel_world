@@ -6,7 +6,7 @@ use bevy::{
     ecs::system::SystemParam,
     platform::collections::{HashMap, HashSet},
     prelude::*,
-    tasks::AsyncComputeTaskPool,
+    tasks::{AsyncComputeTaskPool, Task},
 };
 use futures_lite::future;
 use std::{
@@ -63,6 +63,25 @@ pub struct VoxelWriteBuffer<C, I>(#[deref] Vec<(IVec3, WorldVoxel<I>)>, PhantomD
 #[derive(Component)]
 pub(crate) struct NeedsMaterial<C>(PhantomData<C>);
 
+#[derive(Resource, Default)]
+pub struct ChunkDespawnTaskState<C: VoxelWorldConfig> {
+    pending: Option<Task<Vec<ChunkDespawnDecision>>>,
+    queued: VecDeque<ChunkDespawnDecision>,
+    _marker: PhantomData<C>,
+}
+
+#[derive(Clone, Copy)]
+struct ChunkDespawnCandidate {
+    entity: Entity,
+    position: IVec3,
+}
+
+#[derive(Clone, Copy)]
+struct ChunkDespawnDecision {
+    entity: Entity,
+    position: IVec3,
+}
+
 pub(crate) struct Internals<C>(PhantomData<C>);
 
 #[derive(Component)]
@@ -82,6 +101,7 @@ where
         commands.init_resource::<MeshCacheInsertBuffer<C>>();
         commands.init_resource::<ModifiedVoxels<C, C::MaterialIndex>>();
         commands.init_resource::<VoxelWriteBuffer<C, C::MaterialIndex>>();
+        commands.init_resource::<ChunkDespawnTaskState<C>>();
 
         // Create the root node and allow to modify it by the configuration.
         let world_root = commands
@@ -374,28 +394,71 @@ where
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         configuration: Res<C>,
         retired_chunks: Query<(Entity, &Chunk<C>), With<NeedsDespawn>>,
+        mut despawn_tasks: ResMut<ChunkDespawnTaskState<C>>,
     ) {
         let max_despawns = configuration.max_chunk_despawns_per_frame();
         if max_despawns == 0 {
             return;
         }
 
-        let read_lock = chunk_map.get_read_lock();
-        let mut retired = 0usize;
-        for (entity, chunk) in retired_chunks.iter() {
-            if retired >= max_despawns {
-                break;
-            }
+        Self::flush_chunk_despawn_task(&mut despawn_tasks);
 
-            if ChunkMap::<C, C::MaterialIndex>::contains_chunk(
-                &chunk.position,
-                &read_lock,
-            ) {
-                commands.entity(entity).despawn();
-                chunk_map_remove_buffer.push(chunk.position);
+        let mut retired = 0usize;
+        while retired < max_despawns {
+            let Some(decision) = despawn_tasks.queued.pop_front() else {
+                break;
+            };
+
+            if let Ok(mut entity_commands) = commands.get_entity(decision.entity) {
+                entity_commands.despawn();
+                chunk_map_remove_buffer.push(decision.position);
                 retired += 1;
             }
         }
+
+        if retired >= max_despawns {
+            return;
+        }
+
+        Self::spawn_chunk_despawn_task(&chunk_map, &mut despawn_tasks, &retired_chunks);
+    }
+
+    fn flush_chunk_despawn_task(despawn_tasks: &mut ChunkDespawnTaskState<C>) {
+        if let Some(mut task) = despawn_tasks.pending.take() {
+            if let Some(result) = future::block_on(future::poll_once(&mut task)) {
+                despawn_tasks.queued.extend(result);
+            } else {
+                despawn_tasks.pending = Some(task);
+            }
+        }
+    }
+
+    fn spawn_chunk_despawn_task(
+        chunk_map: &ChunkMap<C, C::MaterialIndex>,
+        despawn_tasks: &mut ChunkDespawnTaskState<C>,
+        retired_chunks: &Query<(Entity, &Chunk<C>), With<NeedsDespawn>>,
+    ) {
+        if despawn_tasks.pending.is_some() || !despawn_tasks.queued.is_empty() {
+            return;
+        }
+
+        let mut candidates = Vec::new();
+        for (entity, chunk) in retired_chunks.iter() {
+            candidates.push(ChunkDespawnCandidate {
+                entity,
+                position: chunk.position,
+            });
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let chunk_map_handle = chunk_map.get_map();
+        let thread_pool = AsyncComputeTaskPool::get();
+        despawn_tasks.pending = Some(thread_pool.spawn(async move {
+            compute_chunk_despawn_decisions::<C>(candidates, chunk_map_handle)
+        }));
     }
 
     /// Spawn a thread for each chunk that has been marked by NeedsRemesh
@@ -752,4 +815,24 @@ fn is_in_view(
     } else {
         false
     }
+}
+
+fn compute_chunk_despawn_decisions<C: VoxelWorldConfig>(
+    candidates: Vec<ChunkDespawnCandidate>,
+    chunk_map: Arc<RwLock<ChunkMapData<C::MaterialIndex>>>,
+) -> Vec<ChunkDespawnDecision> {
+    let read_lock = chunk_map.read().unwrap();
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            if read_lock.contains_key(&candidate.position) {
+                Some(ChunkDespawnDecision {
+                    entity: candidate.entity,
+                    position: candidate.position,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
