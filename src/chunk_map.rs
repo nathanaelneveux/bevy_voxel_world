@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    sync::{Arc, RwLock, RwLockReadGuard},
+    sync::{Arc, RwLock, RwLockReadGuard, TryLockError},
 };
 
 use crate::{
@@ -65,6 +65,16 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
 
     pub fn get_read_lock(&self) -> RwLockReadGuard<'_, ChunkMapData<I>> {
         self.map.read().unwrap()
+    }
+
+    pub fn try_get_read_lock(&self) -> Option<RwLockReadGuard<'_, ChunkMapData<I>>> {
+        match self.map.try_read() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(err)) => {
+                panic!("ChunkMap read lock poisoned: {err}");
+            }
+        }
     }
 
     pub fn get_map(&self) -> Arc<RwLock<ChunkMapData<I>>> {
