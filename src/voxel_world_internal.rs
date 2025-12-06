@@ -3,7 +3,9 @@
 /// This module contains the internal systems and resources used to implement bevy_voxel_world.
 ///
 use bevy::{
+    camera::primitives::{Frustum, Sphere},
     ecs::system::SystemParam,
+    math::Vec3A,
     platform::collections::{HashMap, HashSet},
     prelude::*,
     tasks::{AsyncComputeTaskPool, Task},
@@ -32,7 +34,12 @@ use crate::{
 
 #[derive(SystemParam, Deref)]
 pub struct CameraInfo<'w, 's, C: VoxelWorldConfig>(
-    Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<VoxelWorldCamera<C>>>,
+    Query<
+        'w,
+        's,
+        (&'static Camera, &'static GlobalTransform, &'static Frustum),
+        With<VoxelWorldCamera<C>>,
+    >,
 );
 
 /// Holds a map of modified voxels that will persist between chunk spawn/despawn
@@ -127,7 +134,7 @@ where
         let world_root = world_root.single().unwrap();
         let attach_to_root = configuration.attach_chunks_to_root();
 
-        let Ok((camera, cam_gtf)) = camera_info.single() else {
+        let Ok((camera, cam_gtf, frustum)) = camera_info.single() else {
             return;
         };
         let camera_position = cam_gtf.translation();
@@ -224,8 +231,8 @@ where
 
             if spawn_strategy == ChunkSpawnStrategy::CloseAndInView
                 && !chunk_visible_to_camera(
-                    camera,
-                    cam_gtf,
+                    frustum,
+                    camera_position,
                     chunk_position,
                     visibility_margin,
                 )
@@ -300,7 +307,7 @@ where
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
     ) {
-        let Ok((_, cam_gtf)) = camera_info.single() else {
+        let Ok((_, cam_gtf, _)) = camera_info.single() else {
             return;
         };
 
@@ -351,11 +358,12 @@ where
             return;
         }
 
-        let Ok((camera, cam_gtf)) = camera_info.single() else {
+        let Ok((_, cam_gtf, frustum)) = camera_info.single() else {
             return;
         };
 
-        let cam_pos = cam_gtf.translation().as_ivec3();
+        let camera_position = cam_gtf.translation();
+        let cam_pos = camera_position.as_ivec3();
         let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
         let spawning_distance = configuration.spawning_distance() as i32;
         let spawning_distance_squared = spawning_distance.pow(2);
@@ -368,7 +376,7 @@ where
                 ChunkDespawnStrategy::FarAway => false,
                 ChunkDespawnStrategy::FarAwayOrOutOfView => {
                     let frustum_culled =
-                        !chunk_visible_to_camera(camera, cam_gtf, chunk.position, 0.0);
+                        !chunk_visible_to_camera(frustum, camera_position, chunk.position, 0.0);
                     if let Some(visibility) = view_visibility {
                         !visibility.get() || frustum_culled
                     } else {
@@ -760,55 +768,40 @@ where
     }
 }
 
+const SQRT_3: f32 = 1.732_050_8;
+const CHUNK_BOUNDING_SPHERE_RADIUS: f32 = 0.5 * CHUNK_SIZE_F * SQRT_3;
+
 fn chunk_visible_to_camera(
-    camera: &Camera,
-    cam_gtf: &GlobalTransform,
+    frustum: &Frustum,
+    camera_position: Vec3,
     chunk_position: IVec3,
     ndc_margin: f32,
 ) -> bool {
     let chunk_min = chunk_position.as_vec3() * CHUNK_SIZE_F;
     let chunk_max = chunk_min + Vec3::splat(CHUNK_SIZE_F);
 
-    let cam_pos = cam_gtf.translation();
-    if cam_pos.x >= chunk_min.x
-        && cam_pos.x <= chunk_max.x
-        && cam_pos.y >= chunk_min.y
-        && cam_pos.y <= chunk_max.y
-        && cam_pos.z >= chunk_min.z
-        && cam_pos.z <= chunk_max.z
+    if camera_position.x >= chunk_min.x
+        && camera_position.x <= chunk_max.x
+        && camera_position.y >= chunk_min.y
+        && camera_position.y <= chunk_max.y
+        && camera_position.z >= chunk_min.z
+        && camera_position.z <= chunk_max.z
     {
         return true;
     }
 
-    let limit = 1.0 + ndc_margin;
-    let point_in_ndc = |point: Vec3| -> bool {
-        if let Some(ndc) = camera.world_to_ndc(cam_gtf, point) {
-            ndc.x >= -limit
-                && ndc.x <= limit
-                && ndc.y >= -limit
-                && ndc.y <= limit
-                && ndc.z >= -ndc_margin
-                && ndc.z <= 1.0 + ndc_margin
-        } else {
-            false
-        }
+    let chunk_center = (chunk_min + chunk_max) * 0.5;
+    let mut radius = CHUNK_BOUNDING_SPHERE_RADIUS;
+    if ndc_margin > 0.0 {
+        radius += ndc_margin * CHUNK_SIZE_F;
+    }
+
+    let sphere = Sphere {
+        center: Vec3A::from(chunk_center),
+        radius,
     };
 
-    if point_in_ndc((chunk_min + chunk_max) * 0.5) {
-        return true;
-    }
-
-    for &x in &[chunk_min.x, chunk_max.x] {
-        for &y in &[chunk_min.y, chunk_max.y] {
-            for &z in &[chunk_min.z, chunk_max.z] {
-                if point_in_ndc(Vec3::new(x, y, z)) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
+    frustum.intersects_sphere(&sphere, true)
 }
 
 /// Check if the given world point is within the camera's view
