@@ -12,7 +12,7 @@ use futures_lite::future;
 use std::{
     collections::VecDeque,
     marker::PhantomData,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, TryLockError},
 };
 
 use crate::{
@@ -147,7 +147,9 @@ where
             configuration.spawning_rays() * spawning_distance as usize,
         );
 
-        let chunk_map_read_lock = chunk_map.get_read_lock();
+        let Some(chunk_map_read_lock) = chunk_map.try_get_read_lock() else {
+            return;
+        };
 
         // Shoots a ray from the given point, and queue all (non-spawned) chunks intersecting the ray
         let queue_chunks_intersecting_ray_from_point =
@@ -491,7 +493,9 @@ where
             }
 
             let previous_chunk_data = {
-                let read_lock = chunk_map.get_read_lock();
+                let Some(read_lock) = chunk_map.try_get_read_lock() else {
+                    return;
+                };
                 ChunkMap::<C, C::MaterialIndex>::get(&chunk.position, &read_lock)
             };
 
@@ -677,9 +681,17 @@ where
         if buffer.is_empty() {
             return;
         }
-        
-        let chunk_map_read_lock = chunk_map.get_read_lock();
-        let mut modified_voxels = modified_voxels.write().unwrap();
+
+        let Some(chunk_map_read_lock) = chunk_map.try_get_read_lock() else {
+            return;
+        };
+        let mut modified_voxels = match modified_voxels.try_write() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(err)) => {
+                panic!("ModifiedVoxels write lock poisoned: {err}");
+            }
+        };
 
         let mut updated_chunks = HashSet::<(Entity, IVec3)>::new();
 
