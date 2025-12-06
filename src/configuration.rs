@@ -99,7 +99,9 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     /// If you are not using this feature, you can set this to `()`.
     type ChunkUserBundle: Bundle + Clone;
 
-    /// Maximum distance in chunks to spawn chunks, depending on the [`ChunkSpawnStrategy`]
+    /// Maximum distance in chunks to spawn chunks, depending on the [`ChunkSpawnStrategy`].
+    /// Note that this distance is also effectively clamped by the camera's far plane; make sure
+    /// the render camera can actually see out past this radius.
     fn spawning_distance(&self) -> u32 {
         10
     }
