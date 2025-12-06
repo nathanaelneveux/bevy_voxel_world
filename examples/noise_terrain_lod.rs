@@ -175,9 +175,9 @@ fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
             ..default()
         },
         Projection::Perspective(PerspectiveProjection {
-                    far: 999999.0,
-                    ..default()
-                }),
+            far: 999999.0,
+            ..default()
+        }),
         Transform::from_xyz(-200.0, 180.0, -200.0)
             .looking_at(Vec3::new(0.0, 60.0, 0.0), Vec3::Y),
         // This tells bevy_voxel_world to use this cameras transform to calculate spawning area
