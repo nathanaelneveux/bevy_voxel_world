@@ -1,5 +1,4 @@
-use std::hash::Hash;
-use std::sync::Arc;
+use std::{hash::Hash, sync::Arc, time::Duration};
 
 use crate::chunk::{ChunkData, VoxelArray, PADDED_CHUNK_SIZE};
 use crate::meshing::generate_chunk_mesh_for_shape;
@@ -121,6 +120,20 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     /// This is only used if the despawn strategy is `FarAway`
     fn chunk_spawn_strategy(&self) -> ChunkSpawnStrategy {
         ChunkSpawnStrategy::default()
+    }
+
+    /// How often chunk LOD assignments should be re-evaluated.
+    ///
+    /// Shorter intervals keep LODs more responsive at the expense of iterating every chunk.
+    fn chunk_lod_update_interval(&self) -> Duration {
+        Duration::from_millis(53)
+    }
+
+    /// How often chunks should be considered for retirement.
+    ///
+    /// Lower values cull out-of-range chunks more aggressively but spend more CPU time.
+    fn retire_chunks_interval(&self) -> Duration {
+        Duration::from_millis(47)
     }
 
     /// Maximum number of chunks that can be tagged for despawning in a single frame.
