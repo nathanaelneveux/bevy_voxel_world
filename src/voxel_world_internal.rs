@@ -418,6 +418,7 @@ where
         modified_voxels: Res<ModifiedVoxels<C, C::MaterialIndex>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         configuration: Res<C>,
+        camera_info: CameraInfo<C>,
     ) {
         let thread_pool = AsyncComputeTaskPool::get();
         let max_threads = configuration.max_active_chunk_threads();
@@ -427,7 +428,33 @@ where
             return;
         }
 
-        for chunk in dirty_chunks.iter() {
+        let Ok((_, cam_gtf, frustum)) = camera_info.single() else {
+            return;
+        };
+        let camera_position = cam_gtf.translation();
+        let cam_chunk = (camera_position.as_ivec3()) / CHUNK_SIZE_I;
+
+        let mut prioritized_chunks: Vec<(&Chunk<C>, bool, i32)> = dirty_chunks
+            .iter()
+            .map(|chunk| {
+                let visible = chunk_visible_to_camera(
+                    frustum,
+                    camera_position,
+                    chunk.position,
+                    0.0,
+                );
+                let dist_sq = (chunk.position - cam_chunk).length_squared();
+                (chunk, visible, dist_sq)
+            })
+            .collect();
+
+        prioritized_chunks.sort_by(|a, b| {
+            let a_key = (!a.1, a.2);
+            let b_key = (!b.1, b.2);
+            a_key.cmp(&b_key)
+        });
+
+        for (chunk, _, _) in prioritized_chunks.into_iter() {
             if active_threads >= max_threads {
                 break;
             }
