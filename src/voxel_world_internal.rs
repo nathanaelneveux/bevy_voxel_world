@@ -437,7 +437,7 @@ where
         let mut prioritized_chunks: Vec<(&Chunk<C>, bool, i32)> = dirty_chunks
             .iter()
             .map(|(chunk, view_visibility)| {
-                let visible = view_visibility.map(|v| v.get()).unwrap_or(true);
+                let visible = view_visibility.map(|v| v.get()).unwrap_or(false);
                 let dist_sq = (chunk.position - cam_chunk).length_squared();
                 (chunk, visible, dist_sq)
             })
