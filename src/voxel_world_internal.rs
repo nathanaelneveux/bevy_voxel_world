@@ -375,6 +375,9 @@ where
                 || dist_squared > spawning_distance_squared + 1
             {
                 commands.entity(chunk.entity).try_insert(NeedsDespawn);
+                commands
+                    .entity(chunk.entity)
+                    .remove::<NeedsRemesh>();
                 ev_chunk_will_despawn
                     .write(ChunkWillDespawn::<C>::new(chunk.position, chunk.entity));
             }
@@ -410,7 +413,7 @@ where
         mut commands: Commands,
         mut ev_chunk_will_remesh: MessageWriter<ChunkWillRemesh<C>>,
         dirty_chunks: Query<
-            (&Chunk<C>, Option<&ViewVisibility>),
+            &Chunk<C>,
             (With<NeedsRemesh>, Without<ChunkThread<C, C::MaterialIndex>>),
         >,
         chunk_threads: Query<(), With<ChunkThread<C, C::MaterialIndex>>>,
@@ -434,12 +437,11 @@ where
         let camera_position = cam_gtf.translation();
         let cam_chunk = (camera_position.as_ivec3()) / CHUNK_SIZE_I;
 
-        let mut prioritized_chunks: Vec<(&Chunk<C>, bool, i32)> = dirty_chunks
+        let mut prioritized_chunks: Vec<(&Chunk<C>, i32)> = dirty_chunks
             .iter()
-            .map(|(chunk, _view_visibility)| {
-                let visible = true;
+            .map(|chunk| {
                 let dist_sq = (chunk.position - cam_chunk).length_squared();
-                (chunk, visible, dist_sq)
+                (chunk, dist_sq)
             })
             .collect();
 
@@ -453,13 +455,9 @@ where
             return;
         }
 
-        prioritized_chunks.select_nth_unstable_by(select - 1, |a, b| {
-            let a_key = (!a.1, a.2);
-            let b_key = (!b.1, b.2);
-            a_key.cmp(&b_key)
-        });
+        prioritized_chunks.select_nth_unstable_by(select - 1, |a, b| a.1.cmp(&b.1));
 
-        for (chunk, _, _) in prioritized_chunks.into_iter() {
+        for (chunk, _) in prioritized_chunks.into_iter() {
             if active_threads >= max_threads {
                 break;
             }
