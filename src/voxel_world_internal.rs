@@ -448,11 +448,26 @@ where
             })
             .collect();
 
-        prioritized_chunks.sort_by(|a, b| {
+        let available_threads = max_threads.saturating_sub(active_threads);
+        if available_threads == 0 {
+            return;
+        }
+
+        let select = available_threads.min(prioritized_chunks.len());
+        if select == 0 {
+            return;
+        }
+
+        prioritized_chunks.select_nth_unstable_by(select - 1, |a, b| {
             let a_key = (!a.1, a.2);
             let b_key = (!b.1, b.2);
             a_key.cmp(&b_key)
         });
+        // prioritized_chunks[..select].sort_unstable_by(|a, b| {
+        //     let a_key = (!a.1, a.2);
+        //     let b_key = (!b.1, b.2);
+        //     a_key.cmp(&b_key)
+        // });
 
         for (chunk, _, _) in prioritized_chunks.into_iter() {
             if active_threads >= max_threads {
