@@ -410,7 +410,7 @@ where
         mut commands: Commands,
         mut ev_chunk_will_remesh: MessageWriter<ChunkWillRemesh<C>>,
         dirty_chunks: Query<
-            &Chunk<C>,
+            (&Chunk<C>, Option<&ViewVisibility>),
             (With<NeedsRemesh>, Without<ChunkThread<C, C::MaterialIndex>>),
         >,
         chunk_threads: Query<(), With<ChunkThread<C, C::MaterialIndex>>>,
@@ -428,7 +428,7 @@ where
             return;
         }
 
-        let Ok((_, cam_gtf, frustum)) = camera_info.single() else {
+        let Ok((_, cam_gtf, _)) = camera_info.single() else {
             return;
         };
         let camera_position = cam_gtf.translation();
@@ -436,13 +436,8 @@ where
 
         let mut prioritized_chunks: Vec<(&Chunk<C>, bool, i32)> = dirty_chunks
             .iter()
-            .map(|chunk| {
-                let visible = chunk_visible_to_camera(
-                    frustum,
-                    camera_position,
-                    chunk.position,
-                    0.0,
-                );
+            .map(|(chunk, view_visibility)| {
+                let visible = view_visibility.map(|v| v.get()).unwrap_or(true);
                 let dist_sq = (chunk.position - cam_chunk).length_squared();
                 (chunk, visible, dist_sq)
             })
@@ -463,11 +458,6 @@ where
             let b_key = (!b.1, b.2);
             a_key.cmp(&b_key)
         });
-        // prioritized_chunks[..select].sort_unstable_by(|a, b| {
-        //     let a_key = (!a.1, a.2);
-        //     let b_key = (!b.1, b.2);
-        //     a_key.cmp(&b_key)
-        // });
 
         for (chunk, _, _) in prioritized_chunks.into_iter() {
             if active_threads >= max_threads {
