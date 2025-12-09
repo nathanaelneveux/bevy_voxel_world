@@ -108,8 +108,8 @@ where
                     (
                         (
                             Internals::<C>::spawn_chunks,
-                            // Internals::<C>::update_chunk_lods
-                            //     .run_if(on_timer(chunk_lod_interval)),
+                            Internals::<C>::update_chunk_lods
+                                .run_if(on_timer(chunk_lod_interval)),
                             Internals::<C>::retire_chunks
                                 .run_if(on_timer(retire_chunks_interval)),
                         )
