@@ -242,8 +242,9 @@ where
             );
 
             if !has_chunk {
-                let translation =
-                    Transform::from_translation(chunk_position.as_vec3() * CHUNK_SIZE_F - 1.0);
+                let translation = Transform::from_translation(
+                    chunk_position.as_vec3() * CHUNK_SIZE_F - 1.0,
+                );
                 let chunk_entity = commands.spawn((NeedsRemesh, translation)).id();
                 if attach_to_root {
                     commands.entity(world_root).add_child(chunk_entity);
@@ -294,14 +295,7 @@ where
     /// Update chunk LOD assignments and schedule remeshing when a change occurs.
     pub fn update_chunk_lods(
         mut commands: Commands,
-        mut chunks: Query<
-            (Entity, &mut Chunk<C>),
-            (
-                Without<NeedsRemesh>,
-                Without<NeedsRemeshLowPriority>,
-                Without<NeedsDespawn>,
-            ),
-        >,
+        mut chunks: Query<(Entity, &mut Chunk<C>), Without<NeedsDespawn>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
@@ -343,7 +337,6 @@ where
                 .remove::<ChunkThread<C, C::MaterialIndex>>();
         }
     }
-
 
     /// Tags chunks that are eligible for despawning
     pub fn retire_chunks(
@@ -434,7 +427,11 @@ where
         mut ev_chunk_will_remesh: MessageWriter<ChunkWillRemesh<C>>,
         dirty_chunks: Query<
             &Chunk<C>,
-            (With<NeedsRemesh>, Without<NeedsDespawn>, Without<ChunkThread<C, C::MaterialIndex>>),
+            (
+                With<NeedsRemesh>,
+                Without<NeedsDespawn>,
+                Without<ChunkThread<C, C::MaterialIndex>>,
+            ),
         >,
         chunk_threads: Query<(), With<ChunkThread<C, C::MaterialIndex>>>,
         mesh_cache: Res<MeshCache<C>>,
