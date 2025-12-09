@@ -107,8 +107,10 @@ where
         mut chunk_map_insert_buffer: ResMut<ChunkMapInsertBuffer<C, C::MaterialIndex>>,
         world_root: Query<Entity, With<WorldRoot<C>>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
+        mut chunk_query: Query<&mut Chunk<C>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
+        mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
     ) {
         // Panic if no root exists as it is already inserted in the setup.
         let world_root = world_root.single().unwrap();
@@ -137,9 +139,22 @@ where
         let Some(chunk_map_read_lock) = chunk_map.try_get_read_lock() else {
             return;
         };
+        let mut update_chunk_lod = |chunk_data: &ChunkData<C::MaterialIndex>| {
+            let Ok(mut chunk_component) = chunk_query.get_mut(chunk_data.entity) else {
+                return;
+            };
+            Self::apply_chunk_lod_update(
+                &mut commands,
+                chunk_data.entity,
+                &mut chunk_component,
+                &configuration,
+                camera_position,
+                &mut ev_chunk_will_change_lod,
+            );
+        };
 
         // Shoots a ray from the given point, and queue all (non-spawned) chunks intersecting the ray
-        let queue_chunks_intersecting_ray_from_point =
+        let mut queue_chunks_intersecting_ray_from_point =
             |point: Vec2, queue: &mut VecDeque<IVec3>| {
                 let Ok(ray) = camera.viewport_to_world(cam_gtf, point) else {
                     return;
@@ -152,6 +167,7 @@ where
                         &chunk_pos,
                         &chunk_map_read_lock,
                     ) {
+                        update_chunk_lod(&chunk);
                         if chunk.is_full {
                             // If we hit a full chunk, we can stop the ray early
                             break;
@@ -282,7 +298,7 @@ where
     /// Update chunk LOD assignments and schedule remeshing when a change occurs.
     pub fn update_chunk_lods(
         mut commands: Commands,
-        mut chunks: Query<(Entity, &mut Chunk<C>), Without<NeedsDespawn>>,
+        mut chunks: Query<(Entity, &mut Chunk<C>), (Without<NeedsRemesh>, Without<NeedsDespawn>)>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
@@ -294,36 +310,52 @@ where
         let camera_position = cam_gtf.translation();
 
         for (entity, mut chunk) in chunks.iter_mut() {
-            let target_lod = configuration.chunk_lod(
-                chunk.position,
-                Some(chunk.lod_level),
+            Self::apply_chunk_lod_update(
+                &mut commands,
+                entity,
+                &mut chunk,
+                &configuration,
                 camera_position,
+                &mut ev_chunk_will_change_lod,
             );
-            if target_lod == chunk.lod_level {
-                continue;
-            }
-
-            ev_chunk_will_change_lod
-                .write(ChunkWillChangeLod::<C>::new(chunk.position, entity));
-
-            let data_shape = configuration.chunk_data_shape(target_lod);
-            let mesh_shape = configuration.chunk_meshing_shape(target_lod);
-
-            if chunk.data_shape == data_shape && chunk.mesh_shape == mesh_shape {
-                chunk.lod_level = target_lod;
-                // Shape did not change, so nothing to regenerate/remesh.
-                continue;
-            }
-
-            chunk.data_shape = data_shape;
-            chunk.mesh_shape = mesh_shape;
-            chunk.lod_level = target_lod;
-
-            // Ensure a remesh occurs to refresh data at the new LOD.
-            let mut entity_commands = commands.entity(entity);
-            entity_commands.try_insert(NeedsRemesh);
-            entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
         }
+    }
+
+        fn apply_chunk_lod_update(
+        commands: &mut Commands,
+        entity: Entity,
+        chunk: &mut Chunk<C>,
+        configuration: &C,
+        camera_position: Vec3,
+        ev_chunk_will_change_lod: &mut MessageWriter<ChunkWillChangeLod<C>>,
+    ) {
+        let target_lod = configuration.chunk_lod(
+            chunk.position,
+            Some(chunk.lod_level),
+            camera_position,
+        );
+        if target_lod == chunk.lod_level {
+            return;
+        }
+
+        ev_chunk_will_change_lod
+            .write(ChunkWillChangeLod::<C>::new(chunk.position, entity));
+
+        let data_shape = configuration.chunk_data_shape(target_lod);
+        let mesh_shape = configuration.chunk_meshing_shape(target_lod);
+
+        if chunk.data_shape == data_shape && chunk.mesh_shape == mesh_shape {
+            chunk.lod_level = target_lod;
+            return;
+        }
+
+        chunk.data_shape = data_shape;
+        chunk.mesh_shape = mesh_shape;
+        chunk.lod_level = target_lod;
+
+        let mut entity_commands = commands.entity(entity);
+        entity_commands.try_insert(NeedsRemesh);
+        entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
     }
 
     /// Tags chunks that are eligible for despawning
@@ -375,9 +407,6 @@ where
                 || dist_squared > spawning_distance_squared + 1
             {
                 commands.entity(chunk.entity).try_insert(NeedsDespawn);
-                commands
-                    .entity(chunk.entity)
-                    .remove::<NeedsRemesh>();
                 ev_chunk_will_despawn
                     .write(ChunkWillDespawn::<C>::new(chunk.position, chunk.entity));
             }
@@ -414,14 +443,13 @@ where
         mut ev_chunk_will_remesh: MessageWriter<ChunkWillRemesh<C>>,
         dirty_chunks: Query<
             &Chunk<C>,
-            (With<NeedsRemesh>, Without<ChunkThread<C, C::MaterialIndex>>),
+            (With<NeedsRemesh>, Without<NeedsDespawn>, Without<ChunkThread<C, C::MaterialIndex>>),
         >,
         chunk_threads: Query<(), With<ChunkThread<C, C::MaterialIndex>>>,
         mesh_cache: Res<MeshCache<C>>,
         modified_voxels: Res<ModifiedVoxels<C, C::MaterialIndex>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         configuration: Res<C>,
-        camera_info: CameraInfo<C>,
     ) {
         let thread_pool = AsyncComputeTaskPool::get();
         let max_threads = configuration.max_active_chunk_threads();
@@ -431,33 +459,7 @@ where
             return;
         }
 
-        let Ok((_, cam_gtf, _)) = camera_info.single() else {
-            return;
-        };
-        let camera_position = cam_gtf.translation();
-        let cam_chunk = (camera_position.as_ivec3()) / CHUNK_SIZE_I;
-
-        let mut prioritized_chunks: Vec<(&Chunk<C>, i32)> = dirty_chunks
-            .iter()
-            .map(|chunk| {
-                let dist_sq = (chunk.position - cam_chunk).length_squared();
-                (chunk, dist_sq)
-            })
-            .collect();
-
-        let available_threads = max_threads.saturating_sub(active_threads);
-        if available_threads == 0 {
-            return;
-        }
-
-        let select = available_threads.min(prioritized_chunks.len());
-        if select == 0 {
-            return;
-        }
-
-        prioritized_chunks.select_nth_unstable_by(select - 1, |a, b| a.1.cmp(&b.1));
-
-        for (chunk, _) in prioritized_chunks.into_iter() {
+        for chunk in dirty_chunks.into_iter() {
             if active_threads >= max_threads {
                 break;
             }

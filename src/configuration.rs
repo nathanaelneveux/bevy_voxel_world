@@ -126,7 +126,7 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     ///
     /// Shorter intervals keep LODs more responsive at the expense of iterating every chunk.
     fn chunk_lod_update_interval(&self) -> Duration {
-        Duration::from_millis(53)
+        Duration::from_millis(10000)
     }
 
     /// How often chunks should be considered for retirement.
