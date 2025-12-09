@@ -334,7 +334,8 @@ where
             let mut entity_commands = commands.entity(entity);
             entity_commands
                 .try_insert(NeedsRemeshLowPriority)
-                .remove::<ChunkThread<C, C::MaterialIndex>>();
+                .remove::<ChunkThread<C, C::MaterialIndex>>()
+                .remove::<NeedsRemesh>();
         }
     }
 
@@ -433,6 +434,14 @@ where
                 Without<ChunkThread<C, C::MaterialIndex>>,
             ),
         >,
+        dirty_chunks_low: Query<
+            &Chunk<C>,
+            (
+                With<NeedsRemeshLowPriority>,
+                Without<NeedsDespawn>,
+                Without<ChunkThread<C, C::MaterialIndex>>,
+            ),
+        >,
         chunk_threads: Query<(), With<ChunkThread<C, C::MaterialIndex>>>,
         mesh_cache: Res<MeshCache<C>>,
         modified_voxels: Res<ModifiedVoxels<C, C::MaterialIndex>>,
@@ -447,7 +456,7 @@ where
             return;
         }
 
-        for chunk in dirty_chunks.into_iter() {
+        for chunk in dirty_chunks.iter().chain(dirty_chunks_low.iter()) {
             if active_threads >= max_threads {
                 break;
             }
