@@ -64,6 +64,10 @@ where
 pub struct NeedsRemesh;
 
 #[derive(Component)]
+#[component(storage = "SparseSet")]
+pub struct NeedsRemeshLowPriority;
+
+#[derive(Component)]
 pub struct NeedsDespawn;
 
 #[derive(Clone, Debug)]

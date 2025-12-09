@@ -107,10 +107,9 @@ where
         mut chunk_map_insert_buffer: ResMut<ChunkMapInsertBuffer<C, C::MaterialIndex>>,
         world_root: Query<Entity, With<WorldRoot<C>>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
-        mut chunk_query: Query<&mut Chunk<C>>,
+        chunk_low_priority: Query<(), With<NeedsRemeshLowPriority>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
-        mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
     ) {
         // Panic if no root exists as it is already inserted in the setup.
         let world_root = world_root.single().unwrap();
@@ -139,18 +138,14 @@ where
         let Some(chunk_map_read_lock) = chunk_map.try_get_read_lock() else {
             return;
         };
-        let mut update_chunk_lod = |chunk_data: &ChunkData<C::MaterialIndex>| {
-            let Ok(mut chunk_component) = chunk_query.get_mut(chunk_data.entity) else {
-                return;
-            };
-            Self::apply_chunk_lod_update(
-                &mut commands,
-                chunk_data.entity,
-                &mut chunk_component,
-                &configuration,
-                camera_position,
-                &mut ev_chunk_will_change_lod,
-            );
+        let mut promote_low_priority = |chunk_data: &ChunkData<C::MaterialIndex>| {
+            if chunk_low_priority.get(chunk_data.entity).is_ok() {
+                if let Ok(mut entity_commands) = commands.get_entity(chunk_data.entity) {
+                    entity_commands
+                        .remove::<NeedsRemeshLowPriority>()
+                        .try_insert(NeedsRemesh);
+                }
+            }
         };
 
         // Shoots a ray from the given point, and queue all (non-spawned) chunks intersecting the ray
@@ -167,7 +162,7 @@ where
                         &chunk_pos,
                         &chunk_map_read_lock,
                     ) {
-                        update_chunk_lod(&chunk);
+                        promote_low_priority(&chunk);
                         if chunk.is_full {
                             // If we hit a full chunk, we can stop the ray early
                             break;
@@ -298,7 +293,14 @@ where
     /// Update chunk LOD assignments and schedule remeshing when a change occurs.
     pub fn update_chunk_lods(
         mut commands: Commands,
-        mut chunks: Query<(Entity, &mut Chunk<C>), (Without<NeedsRemesh>, Without<NeedsDespawn>)>,
+        mut chunks: Query<
+            (Entity, &mut Chunk<C>),
+            (
+                Without<NeedsRemesh>,
+                Without<NeedsRemeshLowPriority>,
+                Without<NeedsDespawn>,
+            ),
+        >,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
@@ -310,53 +312,37 @@ where
         let camera_position = cam_gtf.translation();
 
         for (entity, mut chunk) in chunks.iter_mut() {
-            Self::apply_chunk_lod_update(
-                &mut commands,
-                entity,
-                &mut chunk,
-                &configuration,
+            let target_lod = configuration.chunk_lod(
+                chunk.position,
+                Some(chunk.lod_level),
                 camera_position,
-                &mut ev_chunk_will_change_lod,
             );
-        }
-    }
+            if target_lod == chunk.lod_level {
+                continue;
+            }
 
-        fn apply_chunk_lod_update(
-        commands: &mut Commands,
-        entity: Entity,
-        chunk: &mut Chunk<C>,
-        configuration: &C,
-        camera_position: Vec3,
-        ev_chunk_will_change_lod: &mut MessageWriter<ChunkWillChangeLod<C>>,
-    ) {
-        let target_lod = configuration.chunk_lod(
-            chunk.position,
-            Some(chunk.lod_level),
-            camera_position,
-        );
-        if target_lod == chunk.lod_level {
-            return;
-        }
+            ev_chunk_will_change_lod
+                .write(ChunkWillChangeLod::<C>::new(chunk.position, entity));
 
-        ev_chunk_will_change_lod
-            .write(ChunkWillChangeLod::<C>::new(chunk.position, entity));
+            let data_shape = configuration.chunk_data_shape(target_lod);
+            let mesh_shape = configuration.chunk_meshing_shape(target_lod);
 
-        let data_shape = configuration.chunk_data_shape(target_lod);
-        let mesh_shape = configuration.chunk_meshing_shape(target_lod);
+            if chunk.data_shape == data_shape && chunk.mesh_shape == mesh_shape {
+                chunk.lod_level = target_lod;
+                continue;
+            }
 
-        if chunk.data_shape == data_shape && chunk.mesh_shape == mesh_shape {
+            chunk.data_shape = data_shape;
+            chunk.mesh_shape = mesh_shape;
             chunk.lod_level = target_lod;
-            return;
+
+            let mut entity_commands = commands.entity(entity);
+            entity_commands
+                .try_insert(NeedsRemeshLowPriority)
+                .remove::<ChunkThread<C, C::MaterialIndex>>();
         }
-
-        chunk.data_shape = data_shape;
-        chunk.mesh_shape = mesh_shape;
-        chunk.lod_level = target_lod;
-
-        let mut entity_commands = commands.entity(entity);
-        entity_commands.try_insert(NeedsRemesh);
-        entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
     }
+
 
     /// Tags chunks that are eligible for despawning
     pub fn retire_chunks(
@@ -406,7 +392,11 @@ where
             if (should_be_culled && !near_camera)
                 || dist_squared > spawning_distance_squared + 1
             {
-                commands.entity(chunk.entity).try_insert(NeedsDespawn);
+                commands
+                    .entity(chunk.entity)
+                    .try_insert(NeedsDespawn)
+                    .remove::<NeedsRemesh>()
+                    .remove::<NeedsRemeshLowPriority>();
                 ev_chunk_will_despawn
                     .write(ChunkWillDespawn::<C>::new(chunk.position, chunk.entity));
             }
@@ -534,7 +524,8 @@ where
                     thread,
                     chunk.position,
                 ))
-                .remove::<NeedsRemesh>();
+                .remove::<NeedsRemesh>()
+                .remove::<NeedsRemeshLowPriority>();
 
             active_threads += 1;
 
@@ -598,6 +589,7 @@ where
                                 commands
                                     .entity(chunk.entity)
                                     .try_insert(NeedsRemesh)
+                                    .remove::<NeedsRemeshLowPriority>()
                                     .remove::<ChunkThread<C, C::MaterialIndex>>();
                                 continue;
                             }
@@ -676,7 +668,8 @@ where
                 ChunkMap::<C, C::MaterialIndex>::get(&chunk_pos, &chunk_map_read_lock)
             {
                 if let Ok(mut ent) = commands.get_entity(chunk_data.entity) {
-                    ent.try_insert(NeedsRemesh);
+                    ent.try_insert(NeedsRemesh)
+                        .remove::<NeedsRemeshLowPriority>();
                     ent.remove::<ChunkThread<C, C::MaterialIndex>>();
                     updated_chunks.insert((chunk_data.entity, chunk_pos));
                 }
