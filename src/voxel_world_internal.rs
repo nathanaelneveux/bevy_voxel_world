@@ -124,6 +124,7 @@ where
         let spawning_distance = configuration.spawning_distance() as i32;
         let spawning_distance_squared = spawning_distance.pow(2);
         let spawn_strategy = configuration.chunk_spawn_strategy();
+        let max_spawn_per_frame = configuration.max_spawn_per_frame();
 
         let viewport_size = camera.physical_viewport_size().unwrap_or_default();
         let visibility_margin = 0.0f32;
@@ -206,10 +207,12 @@ where
         }
 
         // Then, when we have a queue of chunks, we can set them up for spawning
+        let mut spawned_this_frame = 0;
         while let Some(chunk_position) = chunks_deque.pop_front() {
-            if visited.contains(&chunk_position)
-                || chunks_deque.len() > configuration.max_spawn_per_frame()
-            {
+            if spawned_this_frame >= max_spawn_per_frame {
+                break;
+            }
+            if visited.contains(&chunk_position) {
                 continue;
             }
             visited.insert(chunk_position);
@@ -239,7 +242,9 @@ where
             );
 
             if !has_chunk {
-                let chunk_entity = commands.spawn(NeedsRemesh).id();
+                let translation =
+                    Transform::from_translation(chunk_position.as_vec3() * CHUNK_SIZE_F - 1.0);
+                let chunk_entity = commands.spawn((NeedsRemesh, translation)).id();
                 if attach_to_root {
                     commands.entity(world_root).add_child(chunk_entity);
                 }
@@ -261,12 +266,8 @@ where
                 chunk_data.mesh_shape = mesh_shape;
                 chunk_map_insert_buffer.push((chunk_position, chunk_data));
 
-                commands.entity(chunk.entity).try_insert((
-                    chunk,
-                    Transform::from_translation(
-                        chunk_position.as_vec3() * CHUNK_SIZE_F - 1.0,
-                    ),
-                ));
+                commands.entity(chunk_entity).try_insert(chunk);
+                spawned_this_frame += 1;
             } else {
                 continue;
             }
