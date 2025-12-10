@@ -447,6 +447,7 @@ where
         modified_voxels: Res<ModifiedVoxels<C, C::MaterialIndex>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         configuration: Res<C>,
+        camera_info: CameraInfo<C>,
     ) {
         let thread_pool = AsyncComputeTaskPool::get();
         let max_threads = configuration.max_active_chunk_threads();
@@ -456,7 +457,37 @@ where
             return;
         }
 
-        for chunk in dirty_chunks.iter().chain(dirty_chunks_low.iter()) {
+        let Ok((_, cam_gtf, _)) = camera_info.single() else {
+            return;
+        };
+
+        let cam_chunk = cam_gtf.translation().as_ivec3() / CHUNK_SIZE_I;
+
+        let mut prioritized_chunks: Vec<(&Chunk<C>, i32)> = dirty_chunks
+            .iter()
+            .map(|chunk| {
+                let dist_sq = (chunk.position - cam_chunk).length_squared();
+                (chunk, dist_sq)
+            })
+            .collect();
+
+        let available_threads = max_threads.saturating_sub(active_threads);
+        if available_threads == 0 {
+            return;
+        }
+
+        let select = available_threads.min(prioritized_chunks.len());
+
+        if select > 0 {
+            prioritized_chunks.select_nth_unstable_by(select - 1, |a, b| a.1.cmp(&b.1));
+        }
+
+        for chunk in prioritized_chunks
+            .iter()
+            .take(select)
+            .map(|(chunk, _)| *chunk)
+            .chain(dirty_chunks_low.iter())
+        {
             if active_threads >= max_threads {
                 break;
             }
