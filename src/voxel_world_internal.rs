@@ -202,7 +202,7 @@ where
             for y in -distance..=distance {
                 for z in -distance..=distance {
                     let queue_pos = chunk_at_camera + IVec3::new(x, y, z);
-                    chunks_deque.push_back(queue_pos);
+                    chunks_deque.push_front(queue_pos);
                 }
             }
         }
@@ -464,6 +464,9 @@ where
 
         let camera_position = cam_gtf.translation();
         let ray_direction: Vec3 = cam_gtf.forward().into();
+        let min_back_distance =
+            configuration.min_despawn_distance() as f32 * CHUNK_SIZE_F;
+        let min_back_distance_sq = min_back_distance * min_back_distance;
 
         let mut prioritized_chunks: Vec<(&Chunk<C>, f32, f32)> = dirty_chunks
             .iter()
@@ -473,10 +476,12 @@ where
                 let to_center = chunk_center - camera_position;
                 let depth = to_center.dot(ray_direction);
 
-                if depth <= 0.0 {
+                let dist_sq = to_center.length_squared();
+                if dist_sq <= min_back_distance_sq {
+                    (chunk, 0.0, 0.0)
+                } else if depth <= 0.0 {
                     (chunk, f32::MAX, f32::MAX)
                 } else {
-                    let dist_sq = to_center.length_squared();
                     let lateral_sq = (dist_sq - depth * depth).max(0.0);
                     (chunk, lateral_sq, depth)
                 }
