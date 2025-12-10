@@ -12,6 +12,7 @@ use bevy::{
 };
 use futures_lite::future;
 use std::{
+    cmp::Ordering,
     collections::VecDeque,
     marker::PhantomData,
     sync::{Arc, RwLock, TryLockError},
@@ -461,13 +462,24 @@ where
             return;
         };
 
-        let cam_chunk = cam_gtf.translation().as_ivec3() / CHUNK_SIZE_I;
+        let camera_position = cam_gtf.translation();
+        let ray_direction: Vec3 = cam_gtf.forward().into();
 
-        let mut prioritized_chunks: Vec<(&Chunk<C>, i32)> = dirty_chunks
+        let mut prioritized_chunks: Vec<(&Chunk<C>, f32, f32)> = dirty_chunks
             .iter()
             .map(|chunk| {
-                let dist_sq = (chunk.position - cam_chunk).length_squared();
-                (chunk, dist_sq)
+                let chunk_center = chunk.position.as_vec3() * CHUNK_SIZE_F
+                    + Vec3::splat(CHUNK_SIZE_F * 0.5);
+                let to_center = chunk_center - camera_position;
+                let depth = to_center.dot(ray_direction);
+
+                if depth <= 0.0 {
+                    (chunk, f32::MAX, f32::MAX)
+                } else {
+                    let dist_sq = to_center.length_squared();
+                    let lateral_sq = (dist_sq - depth * depth).max(0.0);
+                    (chunk, lateral_sq, depth)
+                }
             })
             .collect();
 
@@ -479,13 +491,21 @@ where
         let select = available_threads.min(prioritized_chunks.len());
 
         if select > 0 {
-            prioritized_chunks.select_nth_unstable_by(select - 1, |a, b| a.1.cmp(&b.1));
+            prioritized_chunks.select_nth_unstable_by(select - 1, |a, b| {
+                match a.1.partial_cmp(&b.1) {
+                    Some(Ordering::Equal) => {
+                        a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
+                    }
+                    Some(ordering) => ordering,
+                    None => Ordering::Equal,
+                }
+            });
         }
 
         for chunk in prioritized_chunks
             .iter()
             .take(select)
-            .map(|(chunk, _)| *chunk)
+            .map(|(chunk, _, _)| *chunk)
             .chain(dirty_chunks_low.iter())
         {
             if active_threads >= max_threads {
