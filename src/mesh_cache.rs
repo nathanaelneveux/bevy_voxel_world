@@ -3,11 +3,10 @@ use std::{
     sync::{Arc, RwLock, Weak},
 };
 
-use bevy::{platform::collections::HashMap, prelude::*};
+use bevy::{log::info_span, platform::collections::HashMap, prelude::*};
 use weak_table::WeakValueHashMap;
 
 use crate::prelude::VoxelWorldConfig;
-use tracing::trace_span;
 
 /// This is used to keep a reference to a mesh handle in each chunk entity. This ensures that the WeakMap
 /// we use to look up mesh handles can drop handles that no chunks are using anymore.
@@ -40,7 +39,7 @@ impl<C: VoxelWorldConfig> MeshCache<C> {
         if let (Ok(mut mesh_handles), Ok(mut user_bundles)) =
             (self.mesh_handles.try_write(), self.user_bundes.try_write())
         {
-            trace_span!(
+            info_span!(
                 "mesh_cache_apply_insert",
                 count = insert_buffer.len() as u64
             )
@@ -52,7 +51,7 @@ impl<C: VoxelWorldConfig> MeshCache<C> {
                     }
                 }
             });
-            trace_span!("mesh_cache_prune").in_scope(|| mesh_handles.remove_expired());
+            info_span!("mesh_cache_prune").in_scope(|| mesh_handles.remove_expired());
             //user_bundles.remove_expired();
         }
     }
