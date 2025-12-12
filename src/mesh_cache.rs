@@ -39,11 +39,7 @@ impl<C: VoxelWorldConfig> MeshCache<C> {
         if let (Ok(mut mesh_handles), Ok(mut user_bundles)) =
             (self.mesh_handles.try_write(), self.user_bundes.try_write())
         {
-            info_span!(
-                "mesh_cache_apply_insert",
-                count = insert_buffer.len() as u64
-            )
-            .in_scope(|| {
+            info_span!("mesh_cache_apply_insert").in_scope(|| {
                 for (voxels, mesh, user_bundle) in insert_buffer.drain(..) {
                     mesh_handles.insert(voxels, mesh);
                     if let Some(user_bundle) = user_bundle {

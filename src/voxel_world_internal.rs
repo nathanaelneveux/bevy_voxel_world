@@ -559,15 +559,13 @@ where
             let mesh_map = mesh_cache.get_mesh_map();
 
             let thread = thread_pool.spawn(async move {
-                info_span!("chunk_generate", chunk = ?chunk_task.position).in_scope(
-                    || {
-                        chunk_task.generate(
-                            voxel_data_fn,
-                            previous_chunk_data.clone(),
-                            regenerate_strategy,
-                        );
-                    },
-                );
+                info_span!("chunk_generate").in_scope(|| {
+                    chunk_task.generate(
+                        voxel_data_fn,
+                        previous_chunk_data.clone(),
+                        regenerate_strategy,
+                    );
+                });
 
                 // No need to mesh if the chunk is empty or full
                 if chunk_task.is_empty() || chunk_task.is_full() {
@@ -580,7 +578,7 @@ where
                     .unwrap()
                     .contains_key(&chunk_task.voxels_hash());
                 if !mesh_cache_hit {
-                    info_span!("chunk_mesh", chunk = ?chunk_task.position).in_scope(|| {
+                    info_span!("chunk_mesh").in_scope(|| {
                         chunk_task.mesh(chunk_meshing_fn, texture_index_mapper);
                     });
                 }
@@ -633,7 +631,7 @@ where
         let (mut chunk_map_update_buffer, mut mesh_cache_insert_buffer) = buffers;
 
         for (entity, mut thread, chunk, transform) in &mut chunking_threads {
-            let poll_span = info_span!("chunk_thread_poll", chunk = ?chunk.position);
+            let poll_span = info_span!("chunk_thread_poll");
             let thread_result =
                 poll_span.in_scope(|| future::block_on(future::poll_once(&mut thread.0)));
 
@@ -649,14 +647,13 @@ where
                         if let Some(mesh_handle) =
                             mesh_cache.get_mesh_handle(&chunk_task.voxels_hash())
                         {
-                            info_span!("mesh_cache_hit", chunk = ?chunk.position)
-                                .in_scope(|| {
-                                    if let Some(user_bundle) =
-                                        mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
-                                    {
-                                        commands.entity(entity).insert(user_bundle);
-                                    }
-                                });
+                            info_span!("mesh_cache_hit").in_scope(|| {
+                                if let Some(user_bundle) =
+                                    mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
+                                {
+                                    commands.entity(entity).insert(user_bundle);
+                                }
+                            });
                             if let Some(user_bundle) =
                                 mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
                             {
@@ -678,14 +675,13 @@ where
                                 Arc::new(mesh_assets.add(chunk_task.mesh.unwrap()));
                             let user_bundle = chunk_task.user_bundle;
 
-                            info_span!("mesh_cache_store", chunk = ?chunk.position)
-                                .in_scope(|| {
-                                    mesh_cache_insert_buffer.push((
-                                        hash,
-                                        mesh_ref.clone(),
-                                        user_bundle.clone(),
-                                    ));
-                                });
+                            info_span!("mesh_cache_store").in_scope(|| {
+                                mesh_cache_insert_buffer.push((
+                                    hash,
+                                    mesh_ref.clone(),
+                                    user_bundle.clone(),
+                                ));
+                            });
                             if let Some(bundle) = user_bundle {
                                 commands.entity(entity).insert(bundle);
                             }
@@ -706,14 +702,13 @@ where
                     .remove::<MeshRef>();
             }
 
-            info_span!("chunk_map_update_buffer_push", chunk = ?chunk.position)
-                .in_scope(|| {
-                    chunk_map_update_buffer.push((
-                        chunk.position,
-                        chunk_task.chunk_data,
-                        ChunkWillSpawn::<C>::new(chunk_task.position, entity),
-                    ));
-                });
+            info_span!("chunk_map_update_buffer_push").in_scope(|| {
+                chunk_map_update_buffer.push((
+                    chunk.position,
+                    chunk_task.chunk_data,
+                    ChunkWillSpawn::<C>::new(chunk_task.position, entity),
+                ));
+            });
 
             commands
                 .entity(chunk.entity)
