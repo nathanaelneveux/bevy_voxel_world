@@ -17,6 +17,7 @@ use std::{
     marker::PhantomData,
     sync::{Arc, RwLock, TryLockError},
 };
+use tracing::trace_span;
 
 use crate::{
     chunk::*,
@@ -558,10 +559,14 @@ where
             let mesh_map = mesh_cache.get_mesh_map();
 
             let thread = thread_pool.spawn(async move {
-                chunk_task.generate(
-                    voxel_data_fn,
-                    previous_chunk_data.clone(),
-                    regenerate_strategy,
+                trace_span!("chunk_generate", chunk = ?chunk_task.position).in_scope(
+                    || {
+                        chunk_task.generate(
+                            voxel_data_fn,
+                            previous_chunk_data.clone(),
+                            regenerate_strategy,
+                        );
+                    },
                 );
 
                 // No need to mesh if the chunk is empty or full
@@ -575,7 +580,11 @@ where
                     .unwrap()
                     .contains_key(&chunk_task.voxels_hash());
                 if !mesh_cache_hit {
-                    chunk_task.mesh(chunk_meshing_fn, texture_index_mapper);
+                    trace_span!("chunk_mesh", chunk = ?chunk_task.position).in_scope(
+                        || {
+                            chunk_task.mesh(chunk_meshing_fn, texture_index_mapper);
+                        },
+                    );
                 }
 
                 chunk_task
@@ -626,7 +635,9 @@ where
         let (mut chunk_map_update_buffer, mut mesh_cache_insert_buffer) = buffers;
 
         for (entity, mut thread, chunk, transform) in &mut chunking_threads {
-            let thread_result = future::block_on(future::poll_once(&mut thread.0));
+            let poll_span = trace_span!("chunk_thread_poll", chunk = ?chunk.position);
+            let thread_result =
+                poll_span.in_scope(|| future::block_on(future::poll_once(&mut thread.0)));
 
             if thread_result.is_none() {
                 continue;
@@ -640,6 +651,14 @@ where
                         if let Some(mesh_handle) =
                             mesh_cache.get_mesh_handle(&chunk_task.voxels_hash())
                         {
+                            trace_span!("mesh_cache_hit", chunk = ?chunk.position)
+                                .in_scope(|| {
+                                    if let Some(user_bundle) =
+                                        mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
+                                    {
+                                        commands.entity(entity).insert(user_bundle);
+                                    }
+                                });
                             if let Some(user_bundle) =
                                 mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
                             {
@@ -661,11 +680,14 @@ where
                                 Arc::new(mesh_assets.add(chunk_task.mesh.unwrap()));
                             let user_bundle = chunk_task.user_bundle;
 
-                            mesh_cache_insert_buffer.push((
-                                hash,
-                                mesh_ref.clone(),
-                                user_bundle.clone(),
-                            ));
+                            trace_span!("mesh_cache_store", chunk = ?chunk.position)
+                                .in_scope(|| {
+                                    mesh_cache_insert_buffer.push((
+                                        hash,
+                                        mesh_ref.clone(),
+                                        user_bundle.clone(),
+                                    ));
+                                });
                             if let Some(bundle) = user_bundle {
                                 commands.entity(entity).insert(bundle);
                             }
@@ -686,11 +708,14 @@ where
                     .remove::<MeshRef>();
             }
 
-            chunk_map_update_buffer.push((
-                chunk.position,
-                chunk_task.chunk_data,
-                ChunkWillSpawn::<C>::new(chunk_task.position, entity),
-            ));
+            trace_span!("chunk_map_update_buffer_push", chunk = ?chunk.position)
+                .in_scope(|| {
+                    chunk_map_update_buffer.push((
+                        chunk.position,
+                        chunk_task.chunk_data,
+                        ChunkWillSpawn::<C>::new(chunk_task.position, entity),
+                    ));
+                });
 
             commands
                 .entity(chunk.entity)
@@ -720,8 +745,6 @@ where
             }
         };
 
-        let mut updated_chunks = HashSet::<(Entity, IVec3)>::new();
-
         for (position, voxel) in buffer.iter() {
             let (chunk_pos, _vox_pos) = get_chunk_voxel_position(*position);
             modified_voxels.insert(*position, *voxel);
@@ -734,13 +757,10 @@ where
                     ent.try_insert(NeedsRemesh)
                         .remove::<NeedsRemeshLowPriority>();
                     ent.remove::<ChunkThread<C, C::MaterialIndex>>();
-                    updated_chunks.insert((chunk_data.entity, chunk_pos));
+                    ev_chunk_will_update
+                        .write(ChunkWillUpdate::<C>::new(chunk_pos, chunk_data.entity));
                 }
             }
-        }
-
-        for (entity, chunk_pos) in updated_chunks {
-            ev_chunk_will_update.write(ChunkWillUpdate::<C>::new(chunk_pos, entity));
         }
 
         buffer.clear();

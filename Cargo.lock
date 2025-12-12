@@ -1513,6 +1513,7 @@ dependencies = [
  "ndshape",
  "noise",
  "rand 0.9.2",
+ "tracing",
  "weak-table",
 ]
 
