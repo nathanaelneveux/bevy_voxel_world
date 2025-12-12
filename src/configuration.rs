@@ -105,6 +105,37 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
         10
     }
 
+    /// Strategy for spawning chunks
+    /// This is only used if the despawn strategy is `FarAway`
+    fn chunk_spawn_strategy(&self) -> ChunkSpawnStrategy {
+        ChunkSpawnStrategy::default()
+    }
+
+    /// Maximum number of chunks that can get queued for spawning in a given frame.
+    /// In some scenarios, reducing this number can help with performance, due to less
+    /// thread contention.
+    fn max_spawn_per_frame(&self) -> usize {
+        10000
+    }
+
+    /// Maximum number of chunk generation tasks that may be active simultaneously.
+    fn max_active_chunk_threads(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Number of rays to cast when spawning chunks. Higher values will result in more
+    /// chunks being spawned per frame, but will also increase cpu load, and can lead to
+    /// thread contention.
+    fn spawning_rays(&self) -> usize {
+        100
+    }
+
+    /// How far outside of the viewports spawning rays should get cast. Higher values will
+    /// will reduce the likelyhood of chunks popping in, but will also increase cpu load.
+    fn spawning_ray_margin(&self) -> u32 {
+        25
+    }
+
     /// Minimum distance in chunks to despawn chunks regardless of the [`ChunkSpawnStrategy`].
     /// As a result, this radius will always remain spawned around the camera.
     fn min_despawn_distance(&self) -> u32 {
@@ -114,19 +145,6 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     /// Strategy for despawning chunks
     fn chunk_despawn_strategy(&self) -> ChunkDespawnStrategy {
         ChunkDespawnStrategy::default()
-    }
-
-    /// Strategy for spawning chunks
-    /// This is only used if the despawn strategy is `FarAway`
-    fn chunk_spawn_strategy(&self) -> ChunkSpawnStrategy {
-        ChunkSpawnStrategy::default()
-    }
-
-    /// How often chunk LOD assignments should be re-evaluated.
-    ///
-    /// Shorter intervals keep LODs more responsive at the expense of iterating every chunk.
-    fn chunk_lod_update_interval(&self) -> Duration {
-        Duration::from_millis(53)
     }
 
     /// How often chunks should be considered for retirement.
@@ -142,26 +160,6 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     /// unlimited chunk retirements per frame.
     fn max_chunk_despawns_per_frame(&self) -> usize {
         usize::MAX
-    }
-
-    /// Maximum number of chunks that can get queued for spawning in a given frame.
-    /// In some scenarios, reducing this number can help with performance, due to less
-    /// thread contention.
-    fn max_spawn_per_frame(&self) -> usize {
-        10000
-    }
-
-    /// Number of rays to cast when spawning chunks. Higher values will result in more
-    /// chunks being spawned per frame, but will also increase cpu load, and can lead to
-    /// thread contention.
-    fn spawning_rays(&self) -> usize {
-        100
-    }
-
-    /// How far outside of the viewports spawning rays should get cast. Higher values will
-    /// will reduce the likelyhood of chunks popping in, but will also increase cpu load.
-    fn spawning_ray_margin(&self) -> u32 {
-        25
     }
 
     /// Debugging aids
@@ -244,9 +242,11 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
         ChunkRegenerateStrategy::default()
     }
 
-    /// Maximum number of chunk generation tasks that may be active simultaneously.
-    fn max_active_chunk_threads(&self) -> usize {
-        usize::MAX
+    /// How often chunk LOD assignments should be re-evaluated.
+    ///
+    /// Shorter intervals keep LODs more responsive at the expense of iterating every chunk.
+    fn chunk_lod_update_interval(&self) -> Duration {
+        Duration::from_millis(53)
     }
 
     /// Whether chunk entities should be parented to the world root entity.
@@ -306,6 +306,14 @@ impl DefaultWorld {}
 impl VoxelWorldConfig for DefaultWorld {
     type MaterialIndex = u8;
     type ChunkUserBundle = ();
+
+    fn chunk_lod_update_interval(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn retire_chunks_interval(&self) -> Duration {
+        Duration::ZERO
+    }
 
     fn texture_index_mapper(
         &self,
