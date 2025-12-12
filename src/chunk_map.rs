@@ -97,11 +97,7 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         }
 
         if let Ok(mut write_lock) = self.map.try_write() {
-            info_span!(
-                "chunk_map_apply_insert",
-                count = insert_buffer.len() as u64
-            )
-            .in_scope(|| {
+            info_span!("chunk_map_apply_insert").in_scope(|| {
                 for (position, chunk_data) in insert_buffer.iter() {
                     write_lock.data.insert(
                         *position,
@@ -121,11 +117,7 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
             });
             insert_buffer.clear();
 
-            info_span!(
-                "chunk_map_apply_update",
-                count = update_buffer.len() as u64
-            )
-            .in_scope(|| {
+            info_span!("chunk_map_apply_update").in_scope(|| {
                 for (position, chunk_data, evt) in update_buffer.iter() {
                     write_lock.data.insert(
                         *position,
@@ -148,17 +140,13 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
             update_buffer.clear();
 
             let mut need_rebuild_aabb = false;
-            info_span!(
-                "chunk_map_apply_remove",
-                count = remove_buffer.len() as u64
-            )
-            .in_scope(|| {
+            info_span!("chunk_map_apply_remove").in_scope(|| {
                 for position in remove_buffer.iter() {
                     write_lock.data.remove(position);
 
-                    need_rebuild_aabb =
-                        write_lock.bounds.min.floor().as_ivec3() == *position
-                            || write_lock.bounds.max.floor().as_ivec3() == *position;
+                    need_rebuild_aabb = write_lock.bounds.min.floor().as_ivec3()
+                        == *position
+                        || write_lock.bounds.max.floor().as_ivec3() == *position;
                 }
             });
             remove_buffer.clear();
