@@ -10,11 +10,11 @@ use crate::{
     voxel_world::ChunkWillSpawn,
 };
 use bevy::{
+    log::info_span,
     math::{bounding::Aabb3d, Vec3A},
     prelude::*,
 };
 use hashbrown::HashMap;
-use tracing::trace_span;
 
 #[derive(Deref, DerefMut)]
 pub struct ChunkMapData<I> {
@@ -97,7 +97,7 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         }
 
         if let Ok(mut write_lock) = self.map.try_write() {
-            trace_span!(
+            info_span!(
                 "chunk_map_apply_insert",
                 count = insert_buffer.len() as u64
             )
@@ -121,7 +121,7 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
             });
             insert_buffer.clear();
 
-            trace_span!(
+            info_span!(
                 "chunk_map_apply_update",
                 count = update_buffer.len() as u64
             )
@@ -148,7 +148,7 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
             update_buffer.clear();
 
             let mut need_rebuild_aabb = false;
-            trace_span!(
+            info_span!(
                 "chunk_map_apply_remove",
                 count = remove_buffer.len() as u64
             )
@@ -164,7 +164,7 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
             remove_buffer.clear();
 
             if need_rebuild_aabb {
-                trace_span!("chunk_map_rebuild_bounds").in_scope(|| {
+                info_span!("chunk_map_rebuild_bounds").in_scope(|| {
                     let mut tmp_vec = Vec::with_capacity(write_lock.data.len());
                     for v in write_lock.data.keys() {
                         tmp_vec.push(Vec3A::from(v.as_vec3()));

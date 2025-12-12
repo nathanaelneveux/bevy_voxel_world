@@ -5,6 +5,7 @@
 use bevy::{
     camera::primitives::{Frustum, Sphere},
     ecs::system::SystemParam,
+    log::info_span,
     math::Vec3A,
     platform::collections::{HashMap, HashSet},
     prelude::*,
@@ -17,7 +18,6 @@ use std::{
     marker::PhantomData,
     sync::{Arc, RwLock, TryLockError},
 };
-use tracing::trace_span;
 
 use crate::{
     chunk::*,
@@ -559,7 +559,7 @@ where
             let mesh_map = mesh_cache.get_mesh_map();
 
             let thread = thread_pool.spawn(async move {
-                trace_span!("chunk_generate", chunk = ?chunk_task.position).in_scope(
+                info_span!("chunk_generate", chunk = ?chunk_task.position).in_scope(
                     || {
                         chunk_task.generate(
                             voxel_data_fn,
@@ -580,11 +580,9 @@ where
                     .unwrap()
                     .contains_key(&chunk_task.voxels_hash());
                 if !mesh_cache_hit {
-                    trace_span!("chunk_mesh", chunk = ?chunk_task.position).in_scope(
-                        || {
-                            chunk_task.mesh(chunk_meshing_fn, texture_index_mapper);
-                        },
-                    );
+                    info_span!("chunk_mesh", chunk = ?chunk_task.position).in_scope(|| {
+                        chunk_task.mesh(chunk_meshing_fn, texture_index_mapper);
+                    });
                 }
 
                 chunk_task
@@ -635,7 +633,7 @@ where
         let (mut chunk_map_update_buffer, mut mesh_cache_insert_buffer) = buffers;
 
         for (entity, mut thread, chunk, transform) in &mut chunking_threads {
-            let poll_span = trace_span!("chunk_thread_poll", chunk = ?chunk.position);
+            let poll_span = info_span!("chunk_thread_poll", chunk = ?chunk.position);
             let thread_result =
                 poll_span.in_scope(|| future::block_on(future::poll_once(&mut thread.0)));
 
@@ -651,7 +649,7 @@ where
                         if let Some(mesh_handle) =
                             mesh_cache.get_mesh_handle(&chunk_task.voxels_hash())
                         {
-                            trace_span!("mesh_cache_hit", chunk = ?chunk.position)
+                            info_span!("mesh_cache_hit", chunk = ?chunk.position)
                                 .in_scope(|| {
                                     if let Some(user_bundle) =
                                         mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
@@ -680,7 +678,7 @@ where
                                 Arc::new(mesh_assets.add(chunk_task.mesh.unwrap()));
                             let user_bundle = chunk_task.user_bundle;
 
-                            trace_span!("mesh_cache_store", chunk = ?chunk.position)
+                            info_span!("mesh_cache_store", chunk = ?chunk.position)
                                 .in_scope(|| {
                                     mesh_cache_insert_buffer.push((
                                         hash,
@@ -708,7 +706,7 @@ where
                     .remove::<MeshRef>();
             }
 
-            trace_span!("chunk_map_update_buffer_push", chunk = ?chunk.position)
+            info_span!("chunk_map_update_buffer_push", chunk = ?chunk.position)
                 .in_scope(|| {
                     chunk_map_update_buffer.push((
                         chunk.position,
