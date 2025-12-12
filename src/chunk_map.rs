@@ -14,6 +14,7 @@ use bevy::{
     prelude::*,
 };
 use hashbrown::HashMap;
+use tracing::trace_span;
 
 #[derive(Deref, DerefMut)]
 pub struct ChunkMapData<I> {
@@ -96,60 +97,83 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         }
 
         if let Ok(mut write_lock) = self.map.try_write() {
-            for (position, chunk_data) in insert_buffer.iter() {
-                write_lock.data.insert(
-                    *position,
-                    ChunkData {
-                        position: *position,
-                        ..chunk_data.clone()
-                    },
-                );
+            trace_span!(
+                "chunk_map_apply_insert",
+                count = insert_buffer.len() as u64
+            )
+            .in_scope(|| {
+                for (position, chunk_data) in insert_buffer.iter() {
+                    write_lock.data.insert(
+                        *position,
+                        ChunkData {
+                            position: *position,
+                            ..chunk_data.clone()
+                        },
+                    );
 
-                let position_f = Vec3A::from(position.as_vec3());
-                if position_f.cmplt(write_lock.bounds.min).any() {
-                    write_lock.bounds.min = position_f.min(write_lock.bounds.min);
-                } else if position_f.cmpgt(write_lock.bounds.max).any() {
-                    write_lock.bounds.max = position_f.max(write_lock.bounds.max);
+                    let position_f = Vec3A::from(position.as_vec3());
+                    if position_f.cmplt(write_lock.bounds.min).any() {
+                        write_lock.bounds.min = position_f.min(write_lock.bounds.min);
+                    } else if position_f.cmpgt(write_lock.bounds.max).any() {
+                        write_lock.bounds.max = position_f.max(write_lock.bounds.max);
+                    }
                 }
-            }
+            });
             insert_buffer.clear();
 
-            for (position, chunk_data, evt) in update_buffer.iter() {
-                write_lock.data.insert(
-                    *position,
-                    ChunkData {
-                        position: *position,
-                        ..chunk_data.clone()
-                    },
-                );
+            trace_span!(
+                "chunk_map_apply_update",
+                count = update_buffer.len() as u64
+            )
+            .in_scope(|| {
+                for (position, chunk_data, evt) in update_buffer.iter() {
+                    write_lock.data.insert(
+                        *position,
+                        ChunkData {
+                            position: *position,
+                            ..chunk_data.clone()
+                        },
+                    );
 
-                let position_f = Vec3A::from(position.as_vec3());
-                if position_f.cmplt(write_lock.bounds.min).any() {
-                    write_lock.bounds.min = position_f.min(write_lock.bounds.min);
-                } else if position_f.cmpgt(write_lock.bounds.max).any() {
-                    write_lock.bounds.max = position_f.max(write_lock.bounds.max);
+                    let position_f = Vec3A::from(position.as_vec3());
+                    if position_f.cmplt(write_lock.bounds.min).any() {
+                        write_lock.bounds.min = position_f.min(write_lock.bounds.min);
+                    } else if position_f.cmpgt(write_lock.bounds.max).any() {
+                        write_lock.bounds.max = position_f.max(write_lock.bounds.max);
+                    }
+
+                    ev_chunk_will_spawn.write((*evt).clone());
                 }
-
-                ev_chunk_will_spawn.write((*evt).clone());
-            }
+            });
             update_buffer.clear();
 
             let mut need_rebuild_aabb = false;
-            for position in remove_buffer.iter() {
-                write_lock.data.remove(position);
+            trace_span!(
+                "chunk_map_apply_remove",
+                count = remove_buffer.len() as u64
+            )
+            .in_scope(|| {
+                for position in remove_buffer.iter() {
+                    write_lock.data.remove(position);
 
-                need_rebuild_aabb = write_lock.bounds.min.floor().as_ivec3() == *position
-                    || write_lock.bounds.max.floor().as_ivec3() == *position;
-            }
+                    need_rebuild_aabb =
+                        write_lock.bounds.min.floor().as_ivec3() == *position
+                            || write_lock.bounds.max.floor().as_ivec3() == *position;
+                }
+            });
             remove_buffer.clear();
 
             if need_rebuild_aabb {
-                let mut tmp_vec = Vec::with_capacity(write_lock.data.len());
-                for v in write_lock.data.keys() {
-                    tmp_vec.push(Vec3A::from(v.as_vec3()));
-                }
-                write_lock.bounds =
-                    Aabb3d::from_point_cloud(Isometry3d::IDENTITY, tmp_vec.drain(0..));
+                trace_span!("chunk_map_rebuild_bounds").in_scope(|| {
+                    let mut tmp_vec = Vec::with_capacity(write_lock.data.len());
+                    for v in write_lock.data.keys() {
+                        tmp_vec.push(Vec3A::from(v.as_vec3()));
+                    }
+                    write_lock.bounds = Aabb3d::from_point_cloud(
+                        Isometry3d::IDENTITY,
+                        tmp_vec.drain(0..),
+                    );
+                });
             }
         }
     }
