@@ -307,6 +307,9 @@ where
         };
 
         let camera_position = cam_gtf.translation();
+        let camera_chunk = (camera_position.as_ivec3()) / CHUNK_SIZE_I;
+        let min_despawn_distance_sq =
+            (configuration.min_despawn_distance() as i32).pow(2);
 
         for (entity, mut chunk) in chunks.iter_mut() {
             let target_lod = configuration.chunk_lod(
@@ -334,10 +337,17 @@ where
             chunk.lod_level = target_lod;
 
             let mut entity_commands = commands.entity(entity);
-            entity_commands
-                .try_insert(NeedsRemeshLowPriority)
-                .remove::<ChunkThread<C, C::MaterialIndex>>()
-                .remove::<NeedsRemesh>();
+            let chunk_distance_sq = chunk.position.distance_squared(camera_chunk);
+            if chunk_distance_sq <= min_despawn_distance_sq {
+                entity_commands
+                    .try_insert(NeedsRemesh)
+                    .remove::<NeedsRemeshLowPriority>();
+            } else {
+                entity_commands
+                    .try_insert(NeedsRemeshLowPriority)
+                    .remove::<NeedsRemesh>();
+            }
+            entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
         }
     }
 
@@ -465,9 +475,9 @@ where
 
         let camera_position = cam_gtf.translation();
         let ray_direction: Vec3 = cam_gtf.forward().into();
-        let min_back_distance =
+        let min_despawn_distance =
             configuration.min_despawn_distance() as f32 * CHUNK_SIZE_F;
-        let min_back_distance_sq = min_back_distance * min_back_distance;
+        let min_despawn_distance_sq = min_despawn_distance * min_despawn_distance;
 
         let mut prioritized_chunks: Vec<(&Chunk<C>, f32, f32)> = dirty_chunks
             .iter()
@@ -478,7 +488,7 @@ where
                 let depth = to_center.dot(ray_direction);
 
                 let dist_sq = to_center.length_squared();
-                if dist_sq <= min_back_distance_sq {
+                if dist_sq <= min_despawn_distance_sq {
                     (chunk, 0.0, 0.0)
                 } else if depth <= 0.0 {
                     (chunk, f32::MAX, f32::MAX)
