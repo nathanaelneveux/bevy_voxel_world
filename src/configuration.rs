@@ -151,10 +151,11 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     ///
     /// Lower values cull out-of-range chunks more aggressively but spend more CPU time.
     fn retire_chunks_interval(&self) -> Duration {
+        //#TODO make this a better generic
         Duration::from_millis(47)
     }
 
-    /// Maximum number of chunks that can be tagged for despawning in a single frame.
+    /// Maximum number of chunks that can be despawned in a single frame.
     ///
     /// Set this to `0` to pause retire/despawn work temporarily. The default allows
     /// unlimited chunk retirements per frame.
@@ -246,6 +247,7 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     ///
     /// Shorter intervals keep LODs more responsive at the expense of iterating every chunk.
     fn chunk_lod_update_interval(&self) -> Duration {
+        //#TODO make this a better generic
         Duration::from_millis(53)
     }
 

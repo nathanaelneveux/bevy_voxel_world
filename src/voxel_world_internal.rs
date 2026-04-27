@@ -13,7 +13,6 @@ use bevy::{
 };
 use futures_lite::future;
 use std::{
-    cmp::Ordering,
     collections::VecDeque,
     marker::PhantomData,
     sync::{Arc, RwLock, TryLockError},
@@ -372,8 +371,7 @@ where
         let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
         let spawning_distance = configuration.spawning_distance() as i32;
         let spawning_distance_squared = spawning_distance.pow(2);
-        let near_distance_squared =
-            (CHUNK_SIZE_I * configuration.min_despawn_distance() as i32).pow(2);
+        let near_distance_squared = (configuration.min_despawn_distance() as i32).pow(2);
         let strategy = configuration.chunk_despawn_strategy();
 
         for (chunk, view_visibility) in all_chunks.iter() {
@@ -459,7 +457,6 @@ where
         modified_voxels: Res<ModifiedVoxels<C, C::MaterialIndex>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         configuration: Res<C>,
-        camera_info: CameraInfo<C>,
     ) {
         let thread_pool = AsyncComputeTaskPool::get();
         let max_threads = configuration.max_active_chunk_threads();
@@ -469,61 +466,7 @@ where
             return;
         }
 
-        let Ok((_, cam_gtf, _)) = camera_info.single() else {
-            return;
-        };
-
-        let camera_position = cam_gtf.translation();
-        let ray_direction: Vec3 = cam_gtf.forward().into();
-        let min_despawn_distance =
-            configuration.min_despawn_distance() as f32 * CHUNK_SIZE_F;
-        let min_despawn_distance_sq = min_despawn_distance * min_despawn_distance;
-
-        let mut prioritized_chunks: Vec<(&Chunk<C>, f32, f32)> = dirty_chunks
-            .iter()
-            .map(|chunk| {
-                let chunk_center = chunk.position.as_vec3() * CHUNK_SIZE_F
-                    + Vec3::splat(CHUNK_SIZE_F * 0.5);
-                let to_center = chunk_center - camera_position;
-                let depth = to_center.dot(ray_direction);
-
-                let dist_sq = to_center.length_squared();
-                if dist_sq <= min_despawn_distance_sq {
-                    (chunk, 0.0, 0.0)
-                } else if depth <= 0.0 {
-                    (chunk, f32::MAX, f32::MAX)
-                } else {
-                    let lateral_sq = (dist_sq - depth * depth).max(0.0);
-                    (chunk, lateral_sq, depth)
-                }
-            })
-            .collect();
-
-        let available_threads = max_threads.saturating_sub(active_threads);
-        if available_threads == 0 {
-            return;
-        }
-
-        let select = available_threads.min(prioritized_chunks.len());
-
-        if select > 0 {
-            prioritized_chunks.select_nth_unstable_by(select - 1, |a, b| {
-                match a.1.partial_cmp(&b.1) {
-                    Some(Ordering::Equal) => {
-                        a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
-                    }
-                    Some(ordering) => ordering,
-                    None => Ordering::Equal,
-                }
-            });
-        }
-
-        for chunk in prioritized_chunks
-            .iter()
-            .take(select)
-            .map(|(chunk, _, _)| *chunk)
-            .chain(dirty_chunks_low.iter())
-        {
+        for chunk in dirty_chunks.iter().chain(dirty_chunks_low.iter()) {
             if active_threads >= max_threads {
                 break;
             }
@@ -664,11 +607,6 @@ where
                                     commands.entity(entity).insert(user_bundle);
                                 }
                             });
-                            if let Some(user_bundle) =
-                                mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
-                            {
-                                commands.entity(entity).insert(user_bundle);
-                            }
 
                             mesh_handle
                         } else {
