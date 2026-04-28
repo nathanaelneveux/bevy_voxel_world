@@ -1,4 +1,4 @@
-use std::{hint::black_box, time::Duration};
+use std::{env, hint::black_box, time::Duration};
 
 use bevy::{
     asset::AssetPlugin, camera::CameraPlugin, mesh::MeshPlugin, prelude::*,
@@ -22,6 +22,9 @@ struct BenchScenario {
     spawning_rays: usize,
     max_spawn_per_frame: usize,
     max_active_chunk_threads: usize,
+    max_chunk_despawns_per_frame: usize,
+    retire_chunks_interval: Duration,
+    chunk_lod_update_interval: Duration,
     enable_lod: bool,
     expensive_generation: bool,
 }
@@ -74,12 +77,18 @@ struct BenchStats {
     remeshed: u64,
     lod_changed: u64,
     voxel_updated: u64,
+    voxel_writes_issued: u64,
+    max_spawned_per_frame: u64,
+    max_despawned_per_frame: u64,
+    max_remeshed_per_frame: u64,
+    max_lod_changed_per_frame: u64,
+    max_voxel_updated_per_frame: u64,
 }
 
 impl Default for BenchWorld {
     fn default() -> Self {
         Self {
-            scenario: scenarios()[0],
+            scenario: base_fast_camera(),
         }
     }
 }
@@ -106,6 +115,18 @@ impl VoxelWorldConfig for BenchWorld {
 
     fn max_active_chunk_threads(&self) -> usize {
         self.scenario.max_active_chunk_threads
+    }
+
+    fn max_chunk_despawns_per_frame(&self) -> usize {
+        self.scenario.max_chunk_despawns_per_frame
+    }
+
+    fn retire_chunks_interval(&self) -> Duration {
+        self.scenario.retire_chunks_interval
+    }
+
+    fn chunk_lod_update_interval(&self) -> Duration {
+        self.scenario.chunk_lod_update_interval
     }
 
     fn chunk_spawn_strategy(&self) -> ChunkSpawnStrategy {
@@ -187,24 +208,25 @@ impl VoxelWorldConfig for BenchWorld {
 }
 
 fn streaming_benches(c: &mut Criterion) {
+    if env::var_os("BVW_BENCH_REPORT").is_some() {
+        print_reports("streaming", scenarios());
+        print_reports("knob_sweeps", knob_scenarios());
+        if env::var_os("BVW_BENCH_REPORT_ONLY").is_some() {
+            return;
+        }
+    }
+
     let mut group = c.benchmark_group("streaming");
     group.sample_size(10);
 
     for scenario in scenarios() {
         group.bench_function(scenario.name, |b| {
             b.iter_batched(
-                || build_app(*scenario),
+                || build_app(scenario),
                 |mut app| {
                     run_frames(&mut app, scenario.frames);
                     let stats = app.world().resource::<BenchStats>();
-                    black_box((
-                        stats.frames,
-                        stats.spawned,
-                        stats.despawned,
-                        stats.remeshed,
-                        stats.lod_changed,
-                        stats.voxel_updated,
-                    ));
+                    black_box(stats.summary_tuple());
                 },
                 BatchSize::SmallInput,
             );
@@ -212,6 +234,25 @@ fn streaming_benches(c: &mut Criterion) {
     }
 
     group.finish();
+
+    let mut knob_group = c.benchmark_group("knob_sweeps");
+    knob_group.sample_size(10);
+
+    for scenario in knob_scenarios() {
+        knob_group.bench_function(scenario.name, |b| {
+            b.iter_batched(
+                || build_app(scenario),
+                |mut app| {
+                    run_frames(&mut app, scenario.frames);
+                    let stats = app.world().resource::<BenchStats>();
+                    black_box(stats.summary_tuple());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    knob_group.finish();
 }
 
 fn build_app(scenario: BenchScenario) -> App {
@@ -286,6 +327,7 @@ fn drive_camera(
 fn issue_voxel_writes(
     control: Res<BenchControl>,
     world: Res<BenchWorld>,
+    mut stats: ResMut<BenchStats>,
     mut voxel_world: VoxelWorld<BenchWorld>,
 ) {
     match world.scenario.writes {
@@ -296,6 +338,7 @@ fn issue_voxel_writes(
                 let z = i / 32;
                 voxel_world.set_voxel(IVec3::new(x, 1, z), WorldVoxel::Solid(7));
             }
+            stats.voxel_writes_issued += writes_per_frame as u64;
         }
         WriteLoad::MovingEdits { writes_per_frame } => {
             let frame = control.frame as i32;
@@ -304,6 +347,7 @@ fn issue_voxel_writes(
                 let z = frame * 2 + (i % 17);
                 voxel_world.set_voxel(IVec3::new(x, 1, z), WorldVoxel::Solid(3));
             }
+            stats.voxel_writes_issued += writes_per_frame as u64;
         }
     }
 }
@@ -316,17 +360,41 @@ fn collect_stats(
     mut lod_changed: MessageReader<ChunkWillChangeLod<BenchWorld>>,
     mut voxel_updated: MessageReader<ChunkWillUpdate<BenchWorld>>,
 ) {
+    let spawned = spawned.read().count() as u64;
+    let despawned = despawned.read().count() as u64;
+    let remeshed = remeshed.read().count() as u64;
+    let lod_changed = lod_changed.read().count() as u64;
+    let voxel_updated = voxel_updated.read().count() as u64;
+
     stats.frames += 1;
-    stats.spawned += spawned.read().count() as u64;
-    stats.despawned += despawned.read().count() as u64;
-    stats.remeshed += remeshed.read().count() as u64;
-    stats.lod_changed += lod_changed.read().count() as u64;
-    stats.voxel_updated += voxel_updated.read().count() as u64;
+    stats.spawned += spawned;
+    stats.despawned += despawned;
+    stats.remeshed += remeshed;
+    stats.lod_changed += lod_changed;
+    stats.voxel_updated += voxel_updated;
+    stats.max_spawned_per_frame = stats.max_spawned_per_frame.max(spawned);
+    stats.max_despawned_per_frame = stats.max_despawned_per_frame.max(despawned);
+    stats.max_remeshed_per_frame = stats.max_remeshed_per_frame.max(remeshed);
+    stats.max_lod_changed_per_frame = stats.max_lod_changed_per_frame.max(lod_changed);
+    stats.max_voxel_updated_per_frame =
+        stats.max_voxel_updated_per_frame.max(voxel_updated);
 }
 
 impl BenchStats {
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn summary_tuple(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
+        (
+            self.frames,
+            self.spawned,
+            self.despawned,
+            self.remeshed,
+            self.lod_changed,
+            self.voxel_updated,
+            self.voxel_writes_issued,
+        )
     }
 }
 
@@ -370,23 +438,59 @@ fn hash_ivec3(pos: IVec3) -> u32 {
     x ^ (x >> 16)
 }
 
-fn scenarios() -> &'static [BenchScenario] {
-    &[
-        BenchScenario {
-            name: "fast_camera_asteroid_field",
-            frames: 96,
-            warmup_frames: 12,
-            world: WorldShape::AsteroidField,
-            camera_path: CameraPath::FastLinear,
-            writes: WriteLoad::None,
-            spawning_distance: 48,
-            min_despawn_distance: 2,
-            spawning_rays: 128,
-            max_spawn_per_frame: 512,
-            max_active_chunk_threads: 64,
-            enable_lod: false,
-            expensive_generation: false,
-        },
+fn print_reports(group: &str, scenarios: Vec<BenchScenario>) {
+    eprintln!("\n{group}");
+    eprintln!(
+        "scenario,frames,spawned,despawned,remeshed,lod_changed,voxel_updated,writes_issued,max_spawned,max_despawned,max_remeshed,max_lod_changed,max_voxel_updated"
+    );
+
+    for scenario in scenarios {
+        let mut app = build_app(scenario);
+        run_frames(&mut app, scenario.frames);
+        let stats = app.world().resource::<BenchStats>();
+        eprintln!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            scenario.name,
+            stats.frames,
+            stats.spawned,
+            stats.despawned,
+            stats.remeshed,
+            stats.lod_changed,
+            stats.voxel_updated,
+            stats.voxel_writes_issued,
+            stats.max_spawned_per_frame,
+            stats.max_despawned_per_frame,
+            stats.max_remeshed_per_frame,
+            stats.max_lod_changed_per_frame,
+            stats.max_voxel_updated_per_frame,
+        );
+    }
+}
+
+fn base_fast_camera() -> BenchScenario {
+    BenchScenario {
+        name: "fast_camera_asteroid_field",
+        frames: 96,
+        warmup_frames: 12,
+        world: WorldShape::AsteroidField,
+        camera_path: CameraPath::FastLinear,
+        writes: WriteLoad::None,
+        spawning_distance: 48,
+        min_despawn_distance: 2,
+        spawning_rays: 128,
+        max_spawn_per_frame: 512,
+        max_active_chunk_threads: 64,
+        max_chunk_despawns_per_frame: usize::MAX,
+        retire_chunks_interval: Duration::ZERO,
+        chunk_lod_update_interval: Duration::ZERO,
+        enable_lod: false,
+        expensive_generation: false,
+    }
+}
+
+fn scenarios() -> Vec<BenchScenario> {
+    vec![
+        base_fast_camera(),
         BenchScenario {
             name: "long_draw_distance_static_camera",
             frames: 96,
@@ -399,6 +503,9 @@ fn scenarios() -> &'static [BenchScenario] {
             spawning_rays: 256,
             max_spawn_per_frame: 2_048,
             max_active_chunk_threads: 128,
+            max_chunk_despawns_per_frame: usize::MAX,
+            retire_chunks_interval: Duration::ZERO,
+            chunk_lod_update_interval: Duration::ZERO,
             enable_lod: false,
             expensive_generation: false,
         },
@@ -414,6 +521,9 @@ fn scenarios() -> &'static [BenchScenario] {
             spawning_rays: 256,
             max_spawn_per_frame: 512,
             max_active_chunk_threads: 64,
+            max_chunk_despawns_per_frame: usize::MAX,
+            retire_chunks_interval: Duration::ZERO,
+            chunk_lod_update_interval: Duration::ZERO,
             enable_lod: false,
             expensive_generation: false,
         },
@@ -431,6 +541,9 @@ fn scenarios() -> &'static [BenchScenario] {
             spawning_rays: 96,
             max_spawn_per_frame: 256,
             max_active_chunk_threads: 64,
+            max_chunk_despawns_per_frame: usize::MAX,
+            retire_chunks_interval: Duration::ZERO,
+            chunk_lod_update_interval: Duration::ZERO,
             enable_lod: false,
             expensive_generation: false,
         },
@@ -446,6 +559,9 @@ fn scenarios() -> &'static [BenchScenario] {
             spawning_rays: 128,
             max_spawn_per_frame: 512,
             max_active_chunk_threads: 64,
+            max_chunk_despawns_per_frame: usize::MAX,
+            retire_chunks_interval: Duration::ZERO,
+            chunk_lod_update_interval: Duration::ZERO,
             enable_lod: true,
             expensive_generation: false,
         },
@@ -461,6 +577,9 @@ fn scenarios() -> &'static [BenchScenario] {
             spawning_rays: 128,
             max_spawn_per_frame: 512,
             max_active_chunk_threads: 64,
+            max_chunk_despawns_per_frame: 256,
+            retire_chunks_interval: Duration::ZERO,
+            chunk_lod_update_interval: Duration::ZERO,
             enable_lod: false,
             expensive_generation: false,
         },
@@ -478,8 +597,139 @@ fn scenarios() -> &'static [BenchScenario] {
             spawning_rays: 128,
             max_spawn_per_frame: 512,
             max_active_chunk_threads: 128,
+            max_chunk_despawns_per_frame: usize::MAX,
+            retire_chunks_interval: Duration::ZERO,
+            chunk_lod_update_interval: Duration::ZERO,
             enable_lod: false,
             expensive_generation: true,
+        },
+    ]
+}
+
+fn knob_scenarios() -> Vec<BenchScenario> {
+    let fast = base_fast_camera();
+    let despawn = BenchScenario {
+        name: "despawn_pressure_jump",
+        frames: 96,
+        warmup_frames: 24,
+        world: WorldShape::AsteroidField,
+        camera_path: CameraPath::DespawnJump,
+        writes: WriteLoad::None,
+        spawning_distance: 56,
+        min_despawn_distance: 2,
+        spawning_rays: 128,
+        max_spawn_per_frame: 512,
+        max_active_chunk_threads: 64,
+        max_chunk_despawns_per_frame: usize::MAX,
+        retire_chunks_interval: Duration::ZERO,
+        chunk_lod_update_interval: Duration::ZERO,
+        enable_lod: false,
+        expensive_generation: false,
+    };
+    let lod = BenchScenario {
+        name: "lod_churn_thresholds",
+        frames: 128,
+        warmup_frames: 16,
+        world: WorldShape::FlatTerrain,
+        camera_path: CameraPath::LodOscillation,
+        writes: WriteLoad::None,
+        spawning_distance: 56,
+        min_despawn_distance: 2,
+        spawning_rays: 128,
+        max_spawn_per_frame: 512,
+        max_active_chunk_threads: 64,
+        max_chunk_despawns_per_frame: usize::MAX,
+        retire_chunks_interval: Duration::ZERO,
+        chunk_lod_update_interval: Duration::ZERO,
+        enable_lod: true,
+        expensive_generation: false,
+    };
+    let contention = BenchScenario {
+        name: "lock_contention_generation_and_writes",
+        frames: 96,
+        warmup_frames: 16,
+        world: WorldShape::AsteroidField,
+        camera_path: CameraPath::FastLinear,
+        writes: WriteLoad::MovingEdits {
+            writes_per_frame: 256,
+        },
+        spawning_distance: 48,
+        min_despawn_distance: 2,
+        spawning_rays: 128,
+        max_spawn_per_frame: 512,
+        max_active_chunk_threads: 128,
+        max_chunk_despawns_per_frame: usize::MAX,
+        retire_chunks_interval: Duration::ZERO,
+        chunk_lod_update_interval: Duration::ZERO,
+        enable_lod: false,
+        expensive_generation: true,
+    };
+
+    vec![
+        BenchScenario {
+            name: "spawn_cap_64",
+            max_spawn_per_frame: 64,
+            ..fast
+        },
+        BenchScenario {
+            name: "spawn_cap_128",
+            max_spawn_per_frame: 128,
+            ..fast
+        },
+        BenchScenario {
+            name: "spawn_cap_512",
+            max_spawn_per_frame: 512,
+            ..fast
+        },
+        BenchScenario {
+            name: "chunk_threads_16",
+            max_active_chunk_threads: 16,
+            ..contention
+        },
+        BenchScenario {
+            name: "chunk_threads_64",
+            max_active_chunk_threads: 64,
+            ..contention
+        },
+        BenchScenario {
+            name: "chunk_threads_128",
+            max_active_chunk_threads: 128,
+            ..contention
+        },
+        BenchScenario {
+            name: "despawn_cap_64",
+            max_chunk_despawns_per_frame: 64,
+            ..despawn
+        },
+        BenchScenario {
+            name: "despawn_cap_256",
+            max_chunk_despawns_per_frame: 256,
+            ..despawn
+        },
+        BenchScenario {
+            name: "despawn_cap_unlimited",
+            max_chunk_despawns_per_frame: usize::MAX,
+            ..despawn
+        },
+        BenchScenario {
+            name: "lod_interval_0ms",
+            chunk_lod_update_interval: Duration::ZERO,
+            ..lod
+        },
+        BenchScenario {
+            name: "lod_interval_53ms",
+            chunk_lod_update_interval: Duration::from_millis(53),
+            ..lod
+        },
+        BenchScenario {
+            name: "retire_interval_0ms",
+            retire_chunks_interval: Duration::ZERO,
+            ..despawn
+        },
+        BenchScenario {
+            name: "retire_interval_47ms",
+            retire_chunks_interval: Duration::from_millis(47),
+            ..despawn
         },
     ]
 }

@@ -1,6 +1,9 @@
 use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::*;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::chunk_map::ChunkMapUpdateBuffer;
 use crate::configuration::VoxelWorldConfig;
@@ -718,31 +721,36 @@ fn set_voxel_same_value_does_not_trigger_remesh() {
 fn set_voxel_different_value_triggers_remesh() {
     let mut app = _test_setup_app();
 
-    // Set initial voxel
-    app.add_systems(Update, |mut voxel_world: VoxelWorld<DefaultWorld>| {
-        voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(1));
-    });
-    app.update();
-    app.update();
-
-    // Now change to a different value — should produce a ChunkWillUpdate event
-    app.add_systems(Update, |mut voxel_world: VoxelWorld<DefaultWorld>| {
-        voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(2));
-    });
-
-    app.update(); // writes Solid(2) to buffer
-    app.update(); // flushes — value differs, should trigger update
-
     app.add_systems(
         Update,
-        |mut ev_chunk_will_update: MessageReader<ChunkWillUpdate<DefaultWorld>>| {
-            let count = ev_chunk_will_update.read().count();
-            assert!(
-                count > 0,
-                "expected ChunkWillUpdate when setting voxel to different value"
-            );
+        |mut voxel_world: VoxelWorld<DefaultWorld>, mut phase: Local<u32>| {
+            if *phase == 0 && voxel_world.get_chunk_data(IVec3::ZERO).is_some() {
+                voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(1));
+                *phase = 1;
+            } else if *phase == 1 {
+                voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(2));
+                *phase = 2;
+            }
         },
     );
 
-    app.update();
+    let saw_update = Arc::new(AtomicBool::new(false));
+    let saw_update_system = saw_update.clone();
+    app.add_systems(
+        Last,
+        move |mut ev_chunk_will_update: MessageReader<ChunkWillUpdate<DefaultWorld>>| {
+            if ev_chunk_will_update.read().next().is_some() {
+                saw_update_system.store(true, Ordering::Relaxed);
+            }
+        },
+    );
+
+    for _ in 0..200 {
+        app.update();
+    }
+
+    assert!(
+        saw_update.load(Ordering::Relaxed),
+        "expected ChunkWillUpdate when setting voxel to different value"
+    );
 }
