@@ -40,7 +40,7 @@ impl VoxelWorldConfig for MainWorld {
     type ChunkUserBundle = ();
 
     fn spawning_distance(&self) -> u32 {
-        200
+        250
     }
 
     fn min_despawn_distance(&self) -> u32 {
@@ -185,8 +185,8 @@ fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         DistanceFog {
             color: *ClearColor::default(),
             falloff: FogFalloff::Linear {
-                start: 125.0 * CHUNK_SIZE_F,
-                end: 200.0 * CHUNK_SIZE_F,
+                start: 175.0 * CHUNK_SIZE_F,
+                end: 250.0 * CHUNK_SIZE_F,
             },
             ..default()
         },

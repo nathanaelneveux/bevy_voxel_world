@@ -4,13 +4,12 @@ use std::{
 };
 
 use crate::{
-    chunk::{self, ChunkData, CHUNK_SIZE_F},
+    chunk::{self, CHUNK_SIZE_F},
     configuration::VoxelWorldConfig,
     voxel::VOXEL_SIZE,
     voxel_world::ChunkWillSpawn,
 };
 use bevy::{
-    log::info_span,
     math::{bounding::Aabb3d, Vec3A},
     prelude::*,
 };
@@ -38,6 +37,13 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         read_lock: &RwLockReadGuard<ChunkMapData<I>>,
     ) -> Option<chunk::ChunkData<I>> {
         read_lock.data.get(position).cloned()
+    }
+
+    pub fn get_ref<'a>(
+        position: &IVec3,
+        read_lock: &'a RwLockReadGuard<ChunkMapData<I>>,
+    ) -> Option<&'a chunk::ChunkData<I>> {
+        read_lock.data.get(position)
     }
 
     pub fn contains_chunk(
@@ -97,75 +103,51 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         }
 
         if let Ok(mut write_lock) = self.map.try_write() {
-            info_span!("chunk_map_apply_insert").in_scope(|| {
-                for (position, chunk_data) in insert_buffer.iter() {
-                    write_lock.data.insert(
-                        *position,
-                        ChunkData {
-                            position: *position,
-                            ..chunk_data.clone()
-                        },
-                    );
+            for (position, chunk_data) in insert_buffer.drain(..) {
+                write_lock.data.insert(position, chunk_data);
 
-                    let position_f = Vec3A::from(position.as_vec3());
-                    if position_f.cmplt(write_lock.bounds.min).any() {
-                        write_lock.bounds.min = position_f.min(write_lock.bounds.min);
-                    } else if position_f.cmpgt(write_lock.bounds.max).any() {
-                        write_lock.bounds.max = position_f.max(write_lock.bounds.max);
-                    }
+                let position_f = Vec3A::from(position.as_vec3());
+                if position_f.cmplt(write_lock.bounds.min).any() {
+                    write_lock.bounds.min = position_f.min(write_lock.bounds.min);
+                } else if position_f.cmpgt(write_lock.bounds.max).any() {
+                    write_lock.bounds.max = position_f.max(write_lock.bounds.max);
                 }
-            });
-            insert_buffer.clear();
+            }
 
-            info_span!("chunk_map_apply_update").in_scope(|| {
-                for (position, chunk_data, evt) in update_buffer.iter() {
-                    write_lock.data.insert(
-                        *position,
-                        ChunkData {
-                            position: *position,
-                            ..chunk_data.clone()
-                        },
-                    );
+            for (position, chunk_data, evt) in update_buffer.drain(..) {
+                write_lock.data.insert(position, chunk_data);
 
-                    let position_f = Vec3A::from(position.as_vec3());
-                    if position_f.cmplt(write_lock.bounds.min).any() {
-                        write_lock.bounds.min = position_f.min(write_lock.bounds.min);
-                    } else if position_f.cmpgt(write_lock.bounds.max).any() {
-                        write_lock.bounds.max = position_f.max(write_lock.bounds.max);
-                    }
-
-                    ev_chunk_will_spawn.write((*evt).clone());
+                let position_f = Vec3A::from(position.as_vec3());
+                if position_f.cmplt(write_lock.bounds.min).any() {
+                    write_lock.bounds.min = position_f.min(write_lock.bounds.min);
+                } else if position_f.cmpgt(write_lock.bounds.max).any() {
+                    write_lock.bounds.max = position_f.max(write_lock.bounds.max);
                 }
-            });
-            update_buffer.clear();
+
+                ev_chunk_will_spawn.write(evt);
+            }
 
             let mut need_rebuild_aabb = false;
-            info_span!("chunk_map_apply_remove").in_scope(|| {
-                for position in remove_buffer.iter() {
-                    write_lock.data.remove(position);
+            for position in remove_buffer.drain(..) {
+                write_lock.data.remove(&position);
 
-                    need_rebuild_aabb = write_lock.bounds.min.floor().as_ivec3()
-                        == *position
-                        || write_lock.bounds.max.floor().as_ivec3() == *position;
-                }
-            });
-            remove_buffer.clear();
+                need_rebuild_aabb |= write_lock.bounds.min.floor().as_ivec3() == position
+                    || write_lock.bounds.max.floor().as_ivec3() == position;
+            }
 
             if need_rebuild_aabb {
-                info_span!("chunk_map_rebuild_bounds").in_scope(|| {
-                    if write_lock.data.is_empty() {
-                        write_lock.bounds = Aabb3d::new(Vec3::ZERO, Vec3::ZERO);
-                    } else {
-                        let mut tmp_vec = Vec::with_capacity(write_lock.data.len());
-                        for v in write_lock.data.keys() {
-                            tmp_vec.push(Vec3A::from(v.as_vec3()));
-                        }
-                        write_lock.bounds = Aabb3d::from_point_cloud(
-                            Isometry3d::IDENTITY,
-                            tmp_vec.drain(0..),
-                        );
+                if write_lock.data.is_empty() {
+                    write_lock.bounds = Aabb3d::new(Vec3::ZERO, Vec3::ZERO);
+                } else {
+                    let mut tmp_vec = Vec::with_capacity(write_lock.data.len());
+                    for v in write_lock.data.keys() {
+                        tmp_vec.push(Vec3A::from(v.as_vec3()));
                     }
-                });
+                    write_lock.bounds = Aabb3d::from_point_cloud(
+                        Isometry3d::IDENTITY,
+                        tmp_vec.drain(0..),
+                    );
+                }
             }
         }
     }

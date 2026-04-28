@@ -375,6 +375,7 @@ impl<C: VoxelWorldConfig + Send + Sync + 'static, I: Hash + Copy + Eq> ChunkTask
         modified_voxels: ModifiedVoxels<C, I>,
     ) -> Self {
         let mut chunk_data = ChunkData::with_entity(entity);
+        chunk_data.position = position;
         chunk_data.lod_level = lod_level;
         chunk_data.data_shape = data_shape;
         chunk_data.mesh_shape = mesh_shape;

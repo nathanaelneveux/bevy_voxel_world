@@ -39,7 +39,12 @@ pub struct CameraInfo<'w, 's, C: VoxelWorldConfig>(
     Query<
         'w,
         's,
-        (&'static Camera, &'static GlobalTransform, &'static Frustum),
+        (
+            &'static Camera,
+            &'static GlobalTransform,
+            &'static Projection,
+            &'static Frustum,
+        ),
         With<VoxelWorldCamera<C>>,
     >,
 );
@@ -201,11 +206,12 @@ where
         let world_root = world_root.single().unwrap();
         let attach_to_root = configuration.attach_chunks_to_root();
 
-        let Ok((camera, cam_gtf, frustum)) = camera_info.single() else {
+        let Ok((camera, cam_gtf, projection, frustum)) = camera_info.single() else {
             return;
         };
         let camera_position = cam_gtf.translation();
         let cam_pos = camera_position.as_ivec3();
+        let visibility = ChunkVisibilityVolume::new(cam_gtf, projection, frustum);
 
         let spawning_distance = configuration.spawning_distance() as i32;
         let spawning_distance_squared = spawning_distance.pow(2);
@@ -226,6 +232,13 @@ where
         } else {
             max_spawn_per_frame
                 .saturating_mul(2)
+                .max(configuration.spawning_rays())
+        };
+        let mut spawn_ray_step_budget = if max_spawn_per_frame == usize::MAX {
+            usize::MAX
+        } else {
+            max_spawn_per_frame
+                .saturating_mul(4)
                 .max(configuration.spawning_rays())
         };
         let mut diagnostics_frame = VoxelWorldDiagnosticsFrame {
@@ -255,7 +268,7 @@ where
 
         // Shoots a ray from the given point, and queue all (non-spawned) chunks intersecting the ray
         let mut queue_chunks_intersecting_ray_from_point =
-            |point: Vec2, queue: &mut VecDeque<IVec3>| {
+            |point: Vec2, queue: &mut VecDeque<IVec3>, ray_step_budget: &mut usize| {
                 let Ok(ray) = camera.viewport_to_world(cam_gtf, point) else {
                     return;
                 };
@@ -263,10 +276,12 @@ where
                 let mut t = 0.0;
                 while t < (spawning_distance * CHUNK_SIZE_I) as f32
                     && queue.len() < candidate_queue_limit
+                    && *ray_step_budget > 0
                 {
+                    *ray_step_budget -= 1;
                     diagnostics_frame.spawn_ray_steps += 1;
                     let chunk_pos = current.as_ivec3() / CHUNK_SIZE_I;
-                    if let Some(chunk) = ChunkMap::<C, C::MaterialIndex>::get(
+                    if let Some(chunk) = ChunkMap::<C, C::MaterialIndex>::get_ref(
                         &chunk_pos,
                         &chunk_map_read_lock,
                     ) {
@@ -288,7 +303,7 @@ where
         let m = configuration.spawning_ray_margin();
         let collect_candidates_start = diagnostics_enabled.then(Instant::now);
         for _ in 0..configuration.spawning_rays() {
-            if chunks_deque.len() >= candidate_queue_limit {
+            if chunks_deque.len() >= candidate_queue_limit || spawn_ray_step_budget == 0 {
                 break;
             }
             let random_point_in_viewport = {
@@ -303,6 +318,7 @@ where
             queue_chunks_intersecting_ray_from_point(
                 random_point_in_viewport,
                 &mut chunks_deque,
+                &mut spawn_ray_step_budget,
             );
         }
         if let Some(start) = collect_candidates_start {
@@ -329,10 +345,9 @@ where
                 diagnostics_frame.spawn_cap_hit = true;
                 break;
             }
-            if visited.contains(&chunk_position) {
+            if !visited.insert(chunk_position) {
                 continue;
             }
-            visited.insert(chunk_position);
             diagnostics_frame.spawn_unique_candidates += 1;
 
             let distance_sq = chunk_position.distance_squared(chunk_at_camera);
@@ -344,12 +359,7 @@ where
             let protected_chunk = distance_sq <= protected_chunk_radius_sq;
             if spawn_strategy == ChunkSpawnStrategy::CloseAndInView && !protected_chunk {
                 diagnostics_frame.spawn_frustum_checks += 1;
-                if !chunk_visible_to_camera(
-                    frustum,
-                    camera_position,
-                    chunk_position,
-                    visibility_margin,
-                ) {
+                if !visibility.contains_chunk(chunk_position, visibility_margin) {
                     diagnostics_frame.spawn_frustum_culled += 1;
                     continue;
                 }
@@ -381,6 +391,7 @@ where
                 );
 
                 let mut chunk_data = ChunkData::with_entity(chunk.entity);
+                chunk_data.position = chunk_position;
                 chunk_data.lod_level = lod_level;
                 chunk_data.data_shape = data_shape;
                 chunk_data.mesh_shape = mesh_shape;
@@ -460,7 +471,7 @@ where
         let mut high_priority = 0;
         let mut low_priority = 0;
         let mut threads_canceled = 0;
-        let Ok((_, cam_gtf, _)) = camera_info.single() else {
+        let Ok((_, cam_gtf, _, _)) = camera_info.single() else {
             return;
         };
 
@@ -528,7 +539,7 @@ where
     /// Tags chunks that are eligible for despawning
     pub fn retire_chunks(
         mut commands: Commands,
-        all_chunks: Query<(&Chunk<C>, Option<&ViewVisibility>), Without<NeedsDespawn>>,
+        all_chunks: Query<&Chunk<C>, Without<NeedsDespawn>>,
         mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
@@ -540,11 +551,12 @@ where
             return;
         }
 
-        let Ok((_, cam_gtf, frustum)) = camera_info.single() else {
+        let Ok((_, cam_gtf, projection, frustum)) = camera_info.single() else {
             return;
         };
 
         let camera_position = cam_gtf.translation();
+        let visibility = ChunkVisibilityVolume::new(cam_gtf, projection, frustum);
         let cam_pos = camera_position.as_ivec3();
         let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
         let spawning_distance = configuration.spawning_distance() as i32;
@@ -557,7 +569,7 @@ where
         let mut frustum_culled_count = 0;
         let mut distance_culled_count = 0;
 
-        for (chunk, view_visibility) in all_chunks.iter() {
+        for chunk in all_chunks.iter() {
             scanned += 1;
             let dist_squared = chunk.position.distance_squared(chunk_at_camera);
             let near_camera = dist_squared <= near_distance_squared;
@@ -569,17 +581,7 @@ where
                         false
                     } else {
                         frustum_checks += 1;
-                        let frustum_culled = !chunk_visible_to_camera(
-                            frustum,
-                            camera_position,
-                            chunk.position,
-                            0.0,
-                        );
-                        if let Some(visibility) = view_visibility {
-                            !visibility.get() || frustum_culled
-                        } else {
-                            frustum_culled
-                        }
+                        !visibility.contains_chunk(chunk.position, 0.0)
                     }
                 }
             };
@@ -691,8 +693,8 @@ where
         let mut started = 0;
 
         if diagnostics_enabled {
-            diagnostics.frame.remesh_pending_high = dirty_chunks.iter().count() as u64;
-            diagnostics.frame.remesh_pending_low = dirty_chunks_low.iter().count() as u64;
+            diagnostics.frame.remesh_pending_high = dirty_chunks.iter().len() as u64;
+            diagnostics.frame.remesh_pending_low = dirty_chunks_low.iter().len() as u64;
             diagnostics.frame.remesh_active_threads = active_threads as u64;
         }
 
@@ -730,7 +732,7 @@ where
             let mesh_shape = chunk.mesh_shape;
             let chunk_meshing_fn = (configuration
                 .chunk_meshing_delegate()
-                .unwrap_or(Box::new(default_chunk_meshing_delegate)))(
+                .unwrap_or_else(|| Box::new(default_chunk_meshing_delegate)))(
                 chunk.position,
                 lod_level,
                 data_shape,
@@ -838,9 +840,7 @@ where
 
         for (entity, mut thread, chunk, transform) in &mut chunking_threads {
             polled += 1;
-            let poll_span = info_span!("chunk_thread_poll");
-            let thread_result =
-                poll_span.in_scope(|| future::block_on(future::poll_once(&mut thread.0)));
+            let thread_result = future::block_on(future::poll_once(&mut thread.0));
 
             if thread_result.is_none() {
                 continue;
@@ -848,75 +848,61 @@ where
             completed += 1;
 
             let chunk_task = thread_result.unwrap();
+            let mut entity_commands = commands.entity(entity);
 
             if !chunk_task.is_empty() {
                 if !chunk_task.is_full() {
+                    let hash = chunk_task.voxels_hash();
                     let mesh_handle = {
-                        if let Some(mesh_handle) =
-                            mesh_cache.get_mesh_handle(&chunk_task.voxels_hash())
-                        {
-                            info_span!("mesh_cache_hit").in_scope(|| {
-                                if let Some(user_bundle) =
-                                    mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
-                                {
-                                    commands.entity(entity).insert(user_bundle);
-                                }
-                            });
+                        if let Some(mesh_handle) = mesh_cache.get_mesh_handle(&hash) {
+                            let user_bundle = mesh_cache.get_user_bundle(&hash);
+                            if let Some(user_bundle) = user_bundle.clone() {
+                                entity_commands.insert(user_bundle);
+                            }
 
                             mesh_handle
                         } else {
                             if chunk_task.mesh.is_none() {
-                                commands
-                                    .entity(chunk.entity)
+                                entity_commands
                                     .try_insert(NeedsRemesh)
                                     .remove::<NeedsRemeshLowPriority>()
                                     .remove::<ChunkThread<C, C::MaterialIndex>>();
                                 continue;
                             }
-                            let hash = chunk_task.voxels_hash();
                             let mesh_ref =
                                 Arc::new(mesh_assets.add(chunk_task.mesh.unwrap()));
                             let user_bundle = chunk_task.user_bundle;
 
-                            info_span!("mesh_cache_store").in_scope(|| {
-                                mesh_cache_insert_buffer.push((
-                                    hash,
-                                    mesh_ref.clone(),
-                                    user_bundle.clone(),
-                                ));
-                            });
+                            mesh_cache_insert_buffer.push((
+                                hash,
+                                mesh_ref.clone(),
+                                user_bundle.clone(),
+                            ));
                             if let Some(bundle) = user_bundle {
-                                commands.entity(entity).insert(bundle);
+                                entity_commands.insert(bundle);
                             }
                             mesh_ref
                         }
                     };
 
-                    commands.entity(entity).try_insert((
+                    entity_commands.try_insert((
                         *transform,
                         MeshRef(mesh_handle),
                         NeedsMaterial::<C>(PhantomData),
                     ));
                 }
             } else {
-                commands
-                    .entity(entity)
-                    .remove::<Mesh3d>()
-                    .remove::<MeshRef>();
+                entity_commands.remove::<Mesh3d>().remove::<MeshRef>();
             }
 
-            info_span!("chunk_map_update_buffer_push").in_scope(|| {
-                chunk_map_update_buffer.push((
-                    chunk.position,
-                    chunk_task.chunk_data,
-                    ChunkWillSpawn::<C>::new(chunk_task.position, entity),
-                ));
-            });
+            chunk_map_update_buffer.push((
+                chunk.position,
+                chunk_task.chunk_data,
+                ChunkWillSpawn::<C>::new(chunk_task.position, entity),
+            ));
             chunk_map_updates += 1;
 
-            commands
-                .entity(chunk.entity)
-                .remove::<ChunkThread<C, C::MaterialIndex>>();
+            entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
         }
 
         if diagnostics_enabled {
@@ -1057,36 +1043,85 @@ where
 const SQRT_3: f32 = 1.732_050_8;
 const CHUNK_BOUNDING_SPHERE_RADIUS: f32 = 0.5 * CHUNK_SIZE_F * SQRT_3;
 
-fn chunk_visible_to_camera(
-    frustum: &Frustum,
-    camera_position: Vec3,
-    chunk_position: IVec3,
-    ndc_margin: f32,
-) -> bool {
-    let chunk_min = chunk_position.as_vec3() * CHUNK_SIZE_F;
+enum ChunkVisibilityVolume<'a> {
+    Perspective {
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        up: Vec3,
+        tan_half_fov_y: f32,
+        tan_half_fov_x: f32,
+        near: f32,
+        far: f32,
+    },
+    Frustum(&'a Frustum),
+}
 
-    if camera_position.x >= chunk_min.x
-        && camera_position.x <= chunk_min.x + CHUNK_SIZE_F
-        && camera_position.y >= chunk_min.y
-        && camera_position.y <= chunk_min.y + CHUNK_SIZE_F
-        && camera_position.z >= chunk_min.z
-        && camera_position.z <= chunk_min.z + CHUNK_SIZE_F
-    {
-        return true;
+impl<'a> ChunkVisibilityVolume<'a> {
+    fn new(
+        camera_transform: &GlobalTransform,
+        projection: &Projection,
+        frustum: &'a Frustum,
+    ) -> Self {
+        match projection {
+            Projection::Perspective(projection) => {
+                let tan_half_fov_y = (projection.fov * 0.5).tan();
+                Self::Perspective {
+                    origin: camera_transform.translation(),
+                    forward: *camera_transform.forward(),
+                    right: *camera_transform.right(),
+                    up: *camera_transform.up(),
+                    tan_half_fov_y,
+                    tan_half_fov_x: tan_half_fov_y * projection.aspect_ratio,
+                    near: projection.near,
+                    far: projection.far,
+                }
+            }
+            _ => Self::Frustum(frustum),
+        }
     }
 
-    let chunk_center = chunk_min + Vec3::splat(CHUNK_SIZE_F * 0.5);
-    let mut radius = CHUNK_BOUNDING_SPHERE_RADIUS;
-    if ndc_margin > 0.0 {
-        radius += ndc_margin * CHUNK_SIZE_F;
+    #[inline]
+    fn contains_chunk(&self, chunk_position: IVec3, ndc_margin: f32) -> bool {
+        let chunk_min = chunk_position.as_vec3() * CHUNK_SIZE_F;
+        let chunk_center = chunk_min + Vec3::splat(CHUNK_SIZE_F * 0.5);
+        let radius = CHUNK_BOUNDING_SPHERE_RADIUS + ndc_margin * CHUNK_SIZE_F;
+
+        match self {
+            Self::Perspective {
+                origin,
+                forward,
+                right,
+                up,
+                tan_half_fov_y,
+                tan_half_fov_x,
+                near,
+                far,
+            } => {
+                let to_chunk = chunk_center - *origin;
+                let depth = to_chunk.dot(*forward);
+                if depth + radius < *near || depth - radius > *far {
+                    return false;
+                }
+
+                let max_x = depth.max(0.0) * *tan_half_fov_x + radius;
+                if to_chunk.dot(*right).abs() > max_x {
+                    return false;
+                }
+
+                let max_y = depth.max(0.0) * *tan_half_fov_y + radius;
+                to_chunk.dot(*up).abs() <= max_y
+            }
+            Self::Frustum(frustum) => {
+                let sphere = Sphere {
+                    center: Vec3A::from(chunk_center),
+                    radius,
+                };
+
+                frustum.intersects_sphere(&sphere, true)
+            }
+        }
     }
-
-    let sphere = Sphere {
-        center: Vec3A::from(chunk_center),
-        radius,
-    };
-
-    frustum.intersects_sphere(&sphere, true)
 }
 
 /// Check if the given world point is within the camera's view
