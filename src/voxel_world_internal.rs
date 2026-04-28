@@ -16,6 +16,7 @@ use std::{
     collections::VecDeque,
     marker::PhantomData,
     sync::{Arc, RwLock, TryLockError},
+    time::Instant,
 };
 
 use crate::{
@@ -76,6 +77,78 @@ pub(crate) struct Internals<C>(PhantomData<C>);
 #[derive(Component)]
 pub struct WorldRoot<C>(PhantomData<C>);
 
+#[derive(Clone, Copy, Default)]
+pub struct VoxelWorldDiagnosticsFrame {
+    pub spawn_chunks_us: u64,
+    pub spawn_collect_candidates_us: u64,
+    pub spawn_process_queue_us: u64,
+    pub update_lods_us: u64,
+    pub retire_chunks_us: u64,
+    pub despawn_chunks_us: u64,
+    pub remesh_dirty_chunks_us: u64,
+    pub spawn_meshes_us: u64,
+    pub flush_voxel_writes_us: u64,
+    pub flush_chunk_map_buffers_us: u64,
+    pub flush_mesh_cache_buffers_us: u64,
+    pub spawn_rays: u64,
+    pub spawn_ray_steps: u64,
+    pub spawn_candidates: u64,
+    pub spawn_unique_candidates: u64,
+    pub spawn_distance_culled: u64,
+    pub spawn_frustum_checks: u64,
+    pub spawn_frustum_culled: u64,
+    pub spawn_existing_chunks: u64,
+    pub spawn_admitted: u64,
+    pub spawn_cap_hit: bool,
+    pub spawn_low_priority_promoted: u64,
+    pub spawn_chunk_map_lock_miss: bool,
+    pub lod_chunks_scanned: u64,
+    pub lod_changed: u64,
+    pub lod_high_priority: u64,
+    pub lod_low_priority: u64,
+    pub lod_threads_canceled: u64,
+    pub retire_chunks_scanned: u64,
+    pub retire_marked: u64,
+    pub retire_frustum_checks: u64,
+    pub retire_frustum_culled: u64,
+    pub retire_distance_culled: u64,
+    pub despawn_retired_scanned: u64,
+    pub despawned: u64,
+    pub despawn_cap_hit: bool,
+    pub remesh_pending_high: u64,
+    pub remesh_pending_low: u64,
+    pub remesh_active_threads: u64,
+    pub remesh_started: u64,
+    pub remesh_cap_hit: bool,
+    pub chunk_threads_polled: u64,
+    pub chunk_threads_completed: u64,
+    pub chunk_map_updates_queued: u64,
+    pub chunk_map_inserts_flushed: u64,
+    pub chunk_map_updates_flushed: u64,
+    pub chunk_map_removes_flushed: u64,
+}
+
+#[derive(Resource, Clone)]
+pub struct VoxelWorldDiagnostics<C> {
+    pub enabled: bool,
+    pub frame: VoxelWorldDiagnosticsFrame,
+    _marker: PhantomData<C>,
+}
+
+impl<C> Default for VoxelWorldDiagnostics<C> {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            frame: VoxelWorldDiagnosticsFrame::default(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+fn elapsed_micros(start: Instant) -> u64 {
+    start.elapsed().as_micros() as u64
+}
+
 impl<C> Internals<C>
 where
     C: VoxelWorldConfig,
@@ -90,6 +163,7 @@ where
         commands.init_resource::<MeshCacheInsertBuffer<C>>();
         commands.init_resource::<ModifiedVoxels<C, C::MaterialIndex>>();
         commands.init_resource::<VoxelWriteBuffer<C, C::MaterialIndex>>();
+        commands.init_resource::<VoxelWorldDiagnostics<C>>();
 
         // Create the root node and allow to modify it by the configuration.
         let world_root = commands
@@ -102,16 +176,27 @@ where
         configuration.init_root(commands, world_root)
     }
 
+    pub fn reset_diagnostics(
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
+        configuration: Res<C>,
+    ) {
+        diagnostics.enabled = configuration.diagnostics_enabled();
+        diagnostics.frame = VoxelWorldDiagnosticsFrame::default();
+    }
+
     /// Find and spawn chunks in need of spawning
     pub fn spawn_chunks(
         mut commands: Commands,
         mut chunk_map_insert_buffer: ResMut<ChunkMapInsertBuffer<C, C::MaterialIndex>>,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         world_root: Query<Entity, With<WorldRoot<C>>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         chunk_low_priority: Query<(), With<NeedsRemeshLowPriority>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
     ) {
+        let diagnostics_enabled = configuration.diagnostics_enabled();
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
         // Panic if no root exists as it is already inserted in the setup.
         let world_root = world_root.single().unwrap();
         let attach_to_root = configuration.attach_chunks_to_root();
@@ -136,13 +221,31 @@ where
         let mut chunks_deque = VecDeque::with_capacity(
             configuration.spawning_rays() * spawning_distance as usize,
         );
+        let candidate_queue_limit = if max_spawn_per_frame == usize::MAX {
+            usize::MAX
+        } else {
+            max_spawn_per_frame
+                .saturating_mul(2)
+                .max(configuration.spawning_rays())
+        };
+        let mut diagnostics_frame = VoxelWorldDiagnosticsFrame {
+            spawn_rays: configuration.spawning_rays() as u64,
+            ..default()
+        };
 
         let Some(chunk_map_read_lock) = chunk_map.try_get_read_lock() else {
+            if diagnostics_enabled {
+                diagnostics.frame.spawn_chunk_map_lock_miss = true;
+                if let Some(start) = diagnostics_start {
+                    diagnostics.frame.spawn_chunks_us = elapsed_micros(start);
+                }
+            }
             return;
         };
         let mut promote_low_priority = |chunk_data: &ChunkData<C::MaterialIndex>| {
             if chunk_low_priority.get(chunk_data.entity).is_ok() {
                 if let Ok(mut entity_commands) = commands.get_entity(chunk_data.entity) {
+                    diagnostics_frame.spawn_low_priority_promoted += 1;
                     entity_commands
                         .remove::<NeedsRemeshLowPriority>()
                         .try_insert(NeedsRemesh);
@@ -158,7 +261,10 @@ where
                 };
                 let mut current = ray.origin;
                 let mut t = 0.0;
-                while t < (spawning_distance * CHUNK_SIZE_I) as f32 {
+                while t < (spawning_distance * CHUNK_SIZE_I) as f32
+                    && queue.len() < candidate_queue_limit
+                {
+                    diagnostics_frame.spawn_ray_steps += 1;
                     let chunk_pos = current.as_ivec3() / CHUNK_SIZE_I;
                     if let Some(chunk) = ChunkMap::<C, C::MaterialIndex>::get(
                         &chunk_pos,
@@ -170,6 +276,7 @@ where
                             break;
                         }
                     } else {
+                        diagnostics_frame.spawn_candidates += 1;
                         queue.push_back(chunk_pos);
                     }
                     t += CHUNK_SIZE_F;
@@ -179,7 +286,11 @@ where
 
         // Each frame we pick some random points on the screen
         let m = configuration.spawning_ray_margin();
+        let collect_candidates_start = diagnostics_enabled.then(Instant::now);
         for _ in 0..configuration.spawning_rays() {
+            if chunks_deque.len() >= candidate_queue_limit {
+                break;
+            }
             let random_point_in_viewport = {
                 let x =
                     rand::random::<f32>() * (viewport_size.x + m * 2) as f32 - m as f32;
@@ -194,8 +305,12 @@ where
                 &mut chunks_deque,
             );
         }
+        if let Some(start) = collect_candidates_start {
+            diagnostics_frame.spawn_collect_candidates_us = elapsed_micros(start);
+        }
 
         // We also queue the chunks closest to the camera to make sure they will always spawn early
+        let process_queue_start = diagnostics_enabled.then(Instant::now);
         let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
         let distance = configuration.min_despawn_distance() as i32;
         for x in -distance..=distance {
@@ -211,30 +326,33 @@ where
         let mut spawned_this_frame = 0;
         while let Some(chunk_position) = chunks_deque.pop_front() {
             if spawned_this_frame >= max_spawn_per_frame {
+                diagnostics_frame.spawn_cap_hit = true;
                 break;
             }
             if visited.contains(&chunk_position) {
                 continue;
             }
             visited.insert(chunk_position);
+            diagnostics_frame.spawn_unique_candidates += 1;
 
-            if chunk_position.distance_squared(chunk_at_camera)
-                > spawning_distance_squared
-            {
+            let distance_sq = chunk_position.distance_squared(chunk_at_camera);
+            if distance_sq > spawning_distance_squared {
+                diagnostics_frame.spawn_distance_culled += 1;
                 continue;
             }
 
-            if spawn_strategy == ChunkSpawnStrategy::CloseAndInView
-                && !chunk_visible_to_camera(
+            let protected_chunk = distance_sq <= protected_chunk_radius_sq;
+            if spawn_strategy == ChunkSpawnStrategy::CloseAndInView && !protected_chunk {
+                diagnostics_frame.spawn_frustum_checks += 1;
+                if !chunk_visible_to_camera(
                     frustum,
                     camera_position,
                     chunk_position,
                     visibility_margin,
-                )
-                && chunk_position.distance_squared(chunk_at_camera)
-                    > protected_chunk_radius_sq
-            {
-                continue;
+                ) {
+                    diagnostics_frame.spawn_frustum_culled += 1;
+                    continue;
+                }
             }
 
             let has_chunk = ChunkMap::<C, C::MaterialIndex>::contains_chunk(
@@ -270,7 +388,9 @@ where
 
                 commands.entity(chunk_entity).try_insert(chunk);
                 spawned_this_frame += 1;
+                diagnostics_frame.spawn_admitted += 1;
             } else {
+                diagnostics_frame.spawn_existing_chunks += 1;
                 continue;
             }
 
@@ -291,16 +411,55 @@ where
                 }
             }
         }
+        if let Some(start) = process_queue_start {
+            diagnostics_frame.spawn_process_queue_us = elapsed_micros(start);
+        }
+
+        if diagnostics_enabled {
+            if let Some(start) = diagnostics_start {
+                diagnostics_frame.spawn_chunks_us = elapsed_micros(start);
+            }
+            diagnostics.frame.spawn_chunks_us = diagnostics_frame.spawn_chunks_us;
+            diagnostics.frame.spawn_collect_candidates_us =
+                diagnostics_frame.spawn_collect_candidates_us;
+            diagnostics.frame.spawn_process_queue_us =
+                diagnostics_frame.spawn_process_queue_us;
+            diagnostics.frame.spawn_rays = diagnostics_frame.spawn_rays;
+            diagnostics.frame.spawn_ray_steps = diagnostics_frame.spawn_ray_steps;
+            diagnostics.frame.spawn_candidates = diagnostics_frame.spawn_candidates;
+            diagnostics.frame.spawn_unique_candidates =
+                diagnostics_frame.spawn_unique_candidates;
+            diagnostics.frame.spawn_distance_culled =
+                diagnostics_frame.spawn_distance_culled;
+            diagnostics.frame.spawn_frustum_checks =
+                diagnostics_frame.spawn_frustum_checks;
+            diagnostics.frame.spawn_frustum_culled =
+                diagnostics_frame.spawn_frustum_culled;
+            diagnostics.frame.spawn_existing_chunks =
+                diagnostics_frame.spawn_existing_chunks;
+            diagnostics.frame.spawn_admitted = diagnostics_frame.spawn_admitted;
+            diagnostics.frame.spawn_cap_hit = diagnostics_frame.spawn_cap_hit;
+            diagnostics.frame.spawn_low_priority_promoted =
+                diagnostics_frame.spawn_low_priority_promoted;
+        }
     }
 
     /// Update chunk LOD assignments and schedule remeshing when a change occurs.
     pub fn update_chunk_lods(
         mut commands: Commands,
         mut chunks: Query<(Entity, &mut Chunk<C>), Without<NeedsDespawn>>,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
     ) {
+        let diagnostics_enabled = configuration.diagnostics_enabled();
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
+        let mut scanned = 0;
+        let mut changed = 0;
+        let mut high_priority = 0;
+        let mut low_priority = 0;
+        let mut threads_canceled = 0;
         let Ok((_, cam_gtf, _)) = camera_info.single() else {
             return;
         };
@@ -311,6 +470,7 @@ where
             (configuration.min_despawn_distance() as i32).pow(2);
 
         for (entity, mut chunk) in chunks.iter_mut() {
+            scanned += 1;
             let target_lod = configuration.chunk_lod(
                 chunk.position,
                 Some(chunk.lod_level),
@@ -319,6 +479,7 @@ where
             if target_lod == chunk.lod_level {
                 continue;
             }
+            changed += 1;
 
             ev_chunk_will_change_lod
                 .write(ChunkWillChangeLod::<C>::new(chunk.position, entity));
@@ -338,15 +499,29 @@ where
             let mut entity_commands = commands.entity(entity);
             let chunk_distance_sq = chunk.position.distance_squared(camera_chunk);
             if chunk_distance_sq <= min_despawn_distance_sq {
+                high_priority += 1;
                 entity_commands
                     .try_insert(NeedsRemesh)
                     .remove::<NeedsRemeshLowPriority>();
             } else {
+                low_priority += 1;
                 entity_commands
                     .try_insert(NeedsRemeshLowPriority)
                     .remove::<NeedsRemesh>();
             }
+            threads_canceled += 1;
             entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
+        }
+
+        if diagnostics_enabled {
+            diagnostics.frame.lod_chunks_scanned = scanned;
+            diagnostics.frame.lod_changed = changed;
+            diagnostics.frame.lod_high_priority = high_priority;
+            diagnostics.frame.lod_low_priority = low_priority;
+            diagnostics.frame.lod_threads_canceled = threads_canceled;
+            if let Some(start) = diagnostics_start {
+                diagnostics.frame.update_lods_us = elapsed_micros(start);
+            }
         }
     }
 
@@ -354,10 +529,13 @@ where
     pub fn retire_chunks(
         mut commands: Commands,
         all_chunks: Query<(&Chunk<C>, Option<&ViewVisibility>), Without<NeedsDespawn>>,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_despawn: MessageWriter<ChunkWillDespawn<C>>,
     ) {
+        let diagnostics_enabled = configuration.diagnostics_enabled();
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
         if configuration.max_chunk_despawns_per_frame() == 0 {
             return;
         }
@@ -373,30 +551,47 @@ where
         let spawning_distance_squared = spawning_distance.pow(2);
         let near_distance_squared = (configuration.min_despawn_distance() as i32).pow(2);
         let strategy = configuration.chunk_despawn_strategy();
+        let mut scanned = 0;
+        let mut marked = 0;
+        let mut frustum_checks = 0;
+        let mut frustum_culled_count = 0;
+        let mut distance_culled_count = 0;
 
         for (chunk, view_visibility) in all_chunks.iter() {
+            scanned += 1;
+            let dist_squared = chunk.position.distance_squared(chunk_at_camera);
+            let near_camera = dist_squared <= near_distance_squared;
+            let distance_culled = dist_squared > spawning_distance_squared + 1;
             let should_be_culled = match strategy {
                 ChunkDespawnStrategy::FarAway => false,
                 ChunkDespawnStrategy::FarAwayOrOutOfView => {
-                    let frustum_culled = !chunk_visible_to_camera(
-                        frustum,
-                        camera_position,
-                        chunk.position,
-                        0.0,
-                    );
-                    if let Some(visibility) = view_visibility {
-                        !visibility.get() || frustum_culled
+                    if near_camera || distance_culled {
+                        false
                     } else {
-                        frustum_culled
+                        frustum_checks += 1;
+                        let frustum_culled = !chunk_visible_to_camera(
+                            frustum,
+                            camera_position,
+                            chunk.position,
+                            0.0,
+                        );
+                        if let Some(visibility) = view_visibility {
+                            !visibility.get() || frustum_culled
+                        } else {
+                            frustum_culled
+                        }
                     }
                 }
             };
 
-            let dist_squared = chunk.position.distance_squared(chunk_at_camera);
-            let near_camera = dist_squared <= near_distance_squared;
-            if (should_be_culled && !near_camera)
-                || dist_squared > spawning_distance_squared + 1
-            {
+            if (should_be_culled && !near_camera) || distance_culled {
+                marked += 1;
+                if should_be_culled && !near_camera {
+                    frustum_culled_count += 1;
+                }
+                if distance_culled {
+                    distance_culled_count += 1;
+                }
                 commands
                     .entity(chunk.entity)
                     .try_insert(NeedsDespawn)
@@ -406,27 +601,56 @@ where
                     .write(ChunkWillDespawn::<C>::new(chunk.position, chunk.entity));
             }
         }
+
+        if diagnostics_enabled {
+            diagnostics.frame.retire_chunks_scanned = scanned;
+            diagnostics.frame.retire_marked = marked;
+            diagnostics.frame.retire_frustum_checks = frustum_checks;
+            diagnostics.frame.retire_frustum_culled = frustum_culled_count;
+            diagnostics.frame.retire_distance_culled = distance_culled_count;
+            if let Some(start) = diagnostics_start {
+                diagnostics.frame.retire_chunks_us = elapsed_micros(start);
+            }
+        }
     }
 
     /// Despawns chunks that have been tagged for despawning
     pub fn despawn_retired_chunks(
         mut commands: Commands,
         mut chunk_map_remove_buffer: ResMut<ChunkMapRemoveBuffer<C>>,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         configuration: Res<C>,
         retired_chunks: Query<(Entity, &Chunk<C>), With<NeedsDespawn>>,
     ) {
+        let diagnostics_enabled = configuration.diagnostics_enabled();
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
         let max_despawns = configuration.max_chunk_despawns_per_frame();
         if max_despawns == 0 {
             return;
         }
 
+        let mut scanned = 0;
+        let mut despawned = 0;
         for (retired, (entity, chunk)) in retired_chunks.iter().enumerate() {
+            scanned += 1;
             if retired >= max_despawns {
+                if diagnostics_enabled {
+                    diagnostics.frame.despawn_cap_hit = true;
+                }
                 break;
             }
 
             commands.entity(entity).despawn();
             chunk_map_remove_buffer.push(chunk.position);
+            despawned += 1;
+        }
+
+        if diagnostics_enabled {
+            diagnostics.frame.despawn_retired_scanned = scanned;
+            diagnostics.frame.despawned = despawned;
+            if let Some(start) = diagnostics_start {
+                diagnostics.frame.despawn_chunks_us = elapsed_micros(start);
+            }
         }
     }
 
@@ -456,27 +680,42 @@ where
         mesh_cache: Res<MeshCache<C>>,
         modified_voxels: Res<ModifiedVoxels<C, C::MaterialIndex>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         configuration: Res<C>,
     ) {
+        let diagnostics_enabled = configuration.diagnostics_enabled();
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
         let thread_pool = AsyncComputeTaskPool::get();
         let max_threads = configuration.max_active_chunk_threads();
         let mut active_threads = chunk_threads.iter().count();
+        let mut started = 0;
+
+        if diagnostics_enabled {
+            diagnostics.frame.remesh_pending_high = dirty_chunks.iter().count() as u64;
+            diagnostics.frame.remesh_pending_low = dirty_chunks_low.iter().count() as u64;
+            diagnostics.frame.remesh_active_threads = active_threads as u64;
+        }
 
         if max_threads == 0 {
             return;
         }
 
+        let Some(chunk_map_read_lock) = chunk_map.try_get_read_lock() else {
+            return;
+        };
+
         for chunk in dirty_chunks.iter().chain(dirty_chunks_low.iter()) {
             if active_threads >= max_threads {
+                if diagnostics_enabled {
+                    diagnostics.frame.remesh_cap_hit = true;
+                }
                 break;
             }
 
-            let previous_chunk_data = {
-                let Some(read_lock) = chunk_map.try_get_read_lock() else {
-                    return;
-                };
-                ChunkMap::<C, C::MaterialIndex>::get(&chunk.position, &read_lock)
-            };
+            let previous_chunk_data = ChunkMap::<C, C::MaterialIndex>::get(
+                &chunk.position,
+                &chunk_map_read_lock,
+            );
 
             let lod_level = chunk.lod_level;
 
@@ -549,9 +788,17 @@ where
                 .remove::<NeedsRemeshLowPriority>();
 
             active_threads += 1;
+            started += 1;
 
             ev_chunk_will_remesh
                 .write(ChunkWillRemesh::<C>::new(chunk.position, chunk.entity));
+        }
+
+        if diagnostics_enabled {
+            diagnostics.frame.remesh_started = started;
+            if let Some(start) = diagnostics_start {
+                diagnostics.frame.remesh_dirty_chunks_us = elapsed_micros(start);
+            }
         }
     }
 
@@ -559,6 +806,7 @@ where
     #[allow(clippy::type_complexity)]
     pub fn spawn_meshes(
         mut commands: Commands,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         mut chunking_threads: Query<
             (
                 Entity,
@@ -575,6 +823,11 @@ where
         ),
         res: (Res<MeshCache<C>>, Res<LoadingTexture>),
     ) {
+        let diagnostics_enabled = diagnostics.enabled;
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
+        let mut polled = 0;
+        let mut completed = 0;
+        let mut chunk_map_updates = 0;
         let (mesh_cache, loading_texture) = res;
 
         if !loading_texture.is_loaded {
@@ -584,6 +837,7 @@ where
         let (mut chunk_map_update_buffer, mut mesh_cache_insert_buffer) = buffers;
 
         for (entity, mut thread, chunk, transform) in &mut chunking_threads {
+            polled += 1;
             let poll_span = info_span!("chunk_thread_poll");
             let thread_result =
                 poll_span.in_scope(|| future::block_on(future::poll_once(&mut thread.0)));
@@ -591,6 +845,7 @@ where
             if thread_result.is_none() {
                 continue;
             }
+            completed += 1;
 
             let chunk_task = thread_result.unwrap();
 
@@ -657,10 +912,20 @@ where
                     ChunkWillSpawn::<C>::new(chunk_task.position, entity),
                 ));
             });
+            chunk_map_updates += 1;
 
             commands
                 .entity(chunk.entity)
                 .remove::<ChunkThread<C, C::MaterialIndex>>();
+        }
+
+        if diagnostics_enabled {
+            diagnostics.frame.chunk_threads_polled = polled;
+            diagnostics.frame.chunk_threads_completed = completed;
+            diagnostics.frame.chunk_map_updates_queued = chunk_map_updates;
+            if let Some(start) = diagnostics_start {
+                diagnostics.frame.spawn_meshes_us = elapsed_micros(start);
+            }
         }
     }
 
@@ -670,7 +935,10 @@ where
         mut ev_chunk_will_update: MessageWriter<ChunkWillUpdate<C>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         modified_voxels: ResMut<ModifiedVoxels<C, C::MaterialIndex>>,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
     ) {
+        let diagnostics_enabled = diagnostics.enabled;
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
         if buffer.is_empty() {
             return;
         }
@@ -714,13 +982,27 @@ where
         }
 
         buffer.clear();
+
+        if diagnostics_enabled {
+            if let Some(start) = diagnostics_start {
+                diagnostics.frame.flush_voxel_writes_us = elapsed_micros(start);
+            }
+        }
     }
 
     pub fn flush_mesh_cache_buffers(
         mut mesh_cache_insert_buffer: ResMut<MeshCacheInsertBuffer<C>>,
         mesh_cache: Res<MeshCache<C>>,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
     ) {
+        let diagnostics_enabled = diagnostics.enabled;
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
         mesh_cache.apply_buffers(&mut mesh_cache_insert_buffer);
+        if diagnostics_enabled {
+            if let Some(start) = diagnostics_start {
+                diagnostics.frame.flush_mesh_cache_buffers_us = elapsed_micros(start);
+            }
+        }
     }
 
     pub fn flush_chunk_map_buffers(
@@ -729,13 +1011,27 @@ where
         mut chunk_map_remove_buffer: ResMut<ChunkMapRemoveBuffer<C>>,
         mut ev_chunk_will_spawn: MessageWriter<ChunkWillSpawn<C>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
+        mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
     ) {
+        let diagnostics_enabled = diagnostics.enabled;
+        let diagnostics_start = diagnostics_enabled.then(Instant::now);
+        let inserts = chunk_map_insert_buffer.len() as u64;
+        let updates = chunk_map_update_buffer.len() as u64;
+        let removes = chunk_map_remove_buffer.len() as u64;
         chunk_map.apply_buffers(
             &mut chunk_map_insert_buffer,
             &mut chunk_map_update_buffer,
             &mut chunk_map_remove_buffer,
             &mut ev_chunk_will_spawn,
         );
+        if diagnostics_enabled {
+            diagnostics.frame.chunk_map_inserts_flushed = inserts;
+            diagnostics.frame.chunk_map_updates_flushed = updates;
+            diagnostics.frame.chunk_map_removes_flushed = removes;
+            if let Some(start) = diagnostics_start {
+                diagnostics.frame.flush_chunk_map_buffers_us = elapsed_micros(start);
+            }
+        }
     }
 
     pub(crate) fn assign_material<M: Material>(
@@ -768,19 +1064,18 @@ fn chunk_visible_to_camera(
     ndc_margin: f32,
 ) -> bool {
     let chunk_min = chunk_position.as_vec3() * CHUNK_SIZE_F;
-    let chunk_max = chunk_min + Vec3::splat(CHUNK_SIZE_F);
 
     if camera_position.x >= chunk_min.x
-        && camera_position.x <= chunk_max.x
+        && camera_position.x <= chunk_min.x + CHUNK_SIZE_F
         && camera_position.y >= chunk_min.y
-        && camera_position.y <= chunk_max.y
+        && camera_position.y <= chunk_min.y + CHUNK_SIZE_F
         && camera_position.z >= chunk_min.z
-        && camera_position.z <= chunk_max.z
+        && camera_position.z <= chunk_min.z + CHUNK_SIZE_F
     {
         return true;
     }
 
-    let chunk_center = (chunk_min + chunk_max) * 0.5;
+    let chunk_center = chunk_min + Vec3::splat(CHUNK_SIZE_F * 0.5);
     let mut radius = CHUNK_BOUNDING_SPHERE_RADIUS;
     if ndc_margin > 0.0 {
         radius += ndc_margin * CHUNK_SIZE_F;

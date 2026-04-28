@@ -1,6 +1,4 @@
-use bevy::{
-    math::bounding::Aabb3d, platform::collections::HashSet, prelude::*, tasks::Task,
-};
+use bevy::{math::bounding::Aabb3d, prelude::*, tasks::Task};
 use ndshape::{ConstShape3u32, RuntimeShape, Shape};
 use std::{
     hash::{Hash, Hasher},
@@ -126,7 +124,7 @@ impl<I: Hash + Copy + PartialEq> ChunkData<I> {
 
     pub(crate) fn generate_hash(&mut self) {
         if let Some(voxels) = &self.voxels {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut hasher = ahash::AHasher::default();
             self.data_shape.to_array().hash(&mut hasher);
             self.mesh_shape.to_array().hash(&mut hasher);
             voxels.hash(&mut hasher);
@@ -404,13 +402,14 @@ impl<C: VoxelWorldConfig + Send + Sync + 'static, I: Hash + Copy + Eq> ChunkTask
     {
         let mut filled_count = 0;
         let modified_voxels = (*self.modified_voxels).read().unwrap();
-        let mut material_count = HashSet::new();
+        let mut first_material = None;
+        let mut has_multiple_materials = false;
         let reuse_previous =
             matches!(strategy, ChunkRegenerateStrategy::Reuse) && previous_data.is_some();
+        let previous_data_ref = previous_data.as_ref();
 
         let desired_shape = self.chunk_data.data_shape;
-        let previous_shape = previous_data
-            .as_ref()
+        let previous_shape = previous_data_ref
             .map(|chunk| chunk.data_shape())
             .unwrap_or(desired_shape);
         let mut active_shape = desired_shape;
@@ -430,14 +429,16 @@ impl<C: VoxelWorldConfig + Send + Sync + 'static, I: Hash + Copy + Eq> ChunkTask
 
         self.chunk_data.data_shape = active_shape;
         let data_shape = RuntimeShape::<u32, 3>::new(active_shape.to_array());
+        let data_shape_size = data_shape.size();
 
-        let mut voxels = vec![WorldVoxel::Unset; data_shape.size() as usize];
+        let mut voxels = vec![WorldVoxel::Unset; data_shape_size as usize];
 
         let scale = voxel_size_from_shape(&data_shape);
 
         self.chunk_data.has_generated = true;
 
-        for i in 0..data_shape.size() {
+        for i in 0..data_shape_size {
+            let idx = i as usize;
             let chunk_block = data_shape.delinearize(i);
 
             let block_pos = IVec3 {
@@ -450,24 +451,32 @@ impl<C: VoxelWorldConfig + Send + Sync + 'static, I: Hash + Copy + Eq> ChunkTask
             };
 
             if let Some(voxel) = modified_voxels.get(&block_pos) {
-                voxels[i as usize] = *voxel;
-                if !voxel.is_unset() && !voxel.is_air() {
+                voxels[idx] = *voxel;
+                if let WorldVoxel::Solid(m) = *voxel {
                     filled_count += 1;
+                    if let Some(first) = first_material {
+                        has_multiple_materials |= first != m;
+                    } else {
+                        first_material = Some(m);
+                    }
                 }
                 continue;
             }
 
-            let previous_voxel = previous_data
-                .as_ref()
+            let previous_voxel = previous_data_ref
                 .and_then(|chunk| chunk.get_voxel_at_world_position(block_pos));
 
             if reuse_previous {
                 if let Some(prev_voxel) = previous_voxel {
                     if !prev_voxel.is_unset() {
-                        voxels[i as usize] = prev_voxel;
+                        voxels[idx] = prev_voxel;
                         if let WorldVoxel::Solid(m) = prev_voxel {
                             filled_count += 1;
-                            material_count.insert(m);
+                            if let Some(first) = first_material {
+                                has_multiple_materials |= first != m;
+                            } else {
+                                first_material = Some(m);
+                            }
                         }
                         continue;
                     }
@@ -476,18 +485,22 @@ impl<C: VoxelWorldConfig + Send + Sync + 'static, I: Hash + Copy + Eq> ChunkTask
 
             let voxel = voxel_data_fn(block_pos, previous_voxel);
 
-            voxels[i as usize] = voxel;
+            voxels[idx] = voxel;
 
             if let WorldVoxel::Solid(m) = voxel {
                 filled_count += 1;
-                material_count.insert(m);
+                if let Some(first) = first_material {
+                    has_multiple_materials |= first != m;
+                } else {
+                    first_material = Some(m);
+                }
             }
         }
 
         self.chunk_data.is_empty = filled_count == 0;
-        self.chunk_data.is_full = filled_count == data_shape.size();
+        self.chunk_data.is_full = filled_count == data_shape_size;
 
-        if self.chunk_data.is_full && material_count.len() == 1 {
+        if self.chunk_data.is_full && !has_multiple_materials {
             self.chunk_data.fill_type = FillType::Uniform(voxels[0]);
             self.chunk_data.voxels = None;
         } else if filled_count > 0 {

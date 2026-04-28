@@ -261,6 +261,13 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
         true
     }
 
+    /// Enables lightweight internal diagnostics counters for benchmarking and profiling.
+    ///
+    /// This is disabled by default to avoid adding timing/counter overhead to normal worlds.
+    fn diagnostics_enabled(&self) -> bool {
+        false
+    }
+
     fn init_root(&self, mut _commands: Commands, _root: Entity) {}
 }
 

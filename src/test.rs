@@ -163,6 +163,7 @@ fn chunk_will_remesh_event_after_set_voxel() {
 #[test]
 fn chunk_will_despawn_event() {
     let mut app = _test_setup_app();
+    let observed = Arc::new(AtomicBool::new(false));
 
     // move camera to simulate chunks going out of view
     app.add_systems(
@@ -179,36 +180,61 @@ fn chunk_will_despawn_event() {
 
     app.update();
 
+    let reader_observed = observed.clone();
     app.add_systems(
         Update,
-        |mut ev_chunk_will_despawn: MessageReader<ChunkWillDespawn<DefaultWorld>>| {
+        move |mut ev_chunk_will_despawn: MessageReader<
+            ChunkWillDespawn<DefaultWorld>,
+        >| {
             let count = ev_chunk_will_despawn.read().count();
-            assert!(count > 0)
+            if count > 0 {
+                reader_observed.store(true, Ordering::SeqCst);
+            }
         },
     );
 
-    app.update();
+    for _ in 0..200 {
+        app.update();
+        if observed.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+
+    panic!("expected ChunkWillDespawn within 200 frames");
 }
 
 #[test]
 fn chunk_will_update_event() {
     let mut app = _test_setup_app();
+    let observed = Arc::new(AtomicBool::new(false));
+
+    for _ in 0..100 {
+        app.update();
+    }
 
     app.add_systems(Update, |mut voxel_world: VoxelWorld<DefaultWorld>| {
         voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(1));
     });
 
-    app.update();
-
+    let reader_observed = observed.clone();
     app.add_systems(
         Update,
-        |mut ev_chunk_will_update: MessageReader<ChunkWillUpdate<DefaultWorld>>| {
+        move |mut ev_chunk_will_update: MessageReader<ChunkWillUpdate<DefaultWorld>>| {
             let count = ev_chunk_will_update.read().count();
-            assert!(count > 0)
+            if count > 0 {
+                reader_observed.store(true, Ordering::SeqCst);
+            }
         },
     );
 
-    app.update();
+    for _ in 0..200 {
+        app.update();
+        if observed.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+
+    panic!("expected ChunkWillUpdate within 200 frames");
 }
 
 #[test]

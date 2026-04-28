@@ -153,14 +153,18 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
 
             if need_rebuild_aabb {
                 info_span!("chunk_map_rebuild_bounds").in_scope(|| {
-                    let mut tmp_vec = Vec::with_capacity(write_lock.data.len());
-                    for v in write_lock.data.keys() {
-                        tmp_vec.push(Vec3A::from(v.as_vec3()));
+                    if write_lock.data.is_empty() {
+                        write_lock.bounds = Aabb3d::new(Vec3::ZERO, Vec3::ZERO);
+                    } else {
+                        let mut tmp_vec = Vec::with_capacity(write_lock.data.len());
+                        for v in write_lock.data.keys() {
+                            tmp_vec.push(Vec3A::from(v.as_vec3()));
+                        }
+                        write_lock.bounds = Aabb3d::from_point_cloud(
+                            Isometry3d::IDENTITY,
+                            tmp_vec.drain(0..),
+                        );
                     }
-                    write_lock.bounds = Aabb3d::from_point_cloud(
-                        Isometry3d::IDENTITY,
-                        tmp_vec.drain(0..),
-                    );
                 });
             }
         }

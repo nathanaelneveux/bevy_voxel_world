@@ -121,6 +121,7 @@ where
             .add_systems(
                 PreUpdate,
                 (
+                    Internals::<C>::reset_diagnostics,
                     (
                         (
                             Internals::<C>::retire_chunks
