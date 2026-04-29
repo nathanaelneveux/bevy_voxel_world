@@ -62,6 +62,7 @@ enum CameraPath {
     FastLinear,
     HighDistanceCruise,
     Static,
+    SlowInChunkDrift,
     LodOscillation,
     DespawnJump,
 }
@@ -153,6 +154,8 @@ struct BenchStats {
     spawn_existing_chunks: u64,
     spawn_admitted: u64,
     spawn_cap_hit_diag_frames: u64,
+    spawn_candidate_queue_limit_hit_frames: u64,
+    spawn_ray_step_budget_hit_frames: u64,
     spawn_low_priority_promoted: u64,
     lod_chunks_scanned: u64,
     lod_high_priority: u64,
@@ -482,24 +485,42 @@ fn drive_camera(
     };
 
     let frame = control.frame as f32;
-    let position = match world.scenario.camera_path {
-        CameraPath::FastLinear => Vec3::new(frame * 18.0, 48.0, -96.0 + frame * 30.0),
-        CameraPath::HighDistanceCruise => {
-            Vec3::new(frame * 24.0, 96.0, -256.0 + frame * 48.0)
+    let (position, look_offset) = match world.scenario.camera_path {
+        CameraPath::FastLinear => (
+            Vec3::new(frame * 18.0, 48.0, -96.0 + frame * 30.0),
+            Vec3::new(0.0, -0.1, 512.0),
+        ),
+        CameraPath::HighDistanceCruise => (
+            Vec3::new(frame * 24.0, 96.0, -256.0 + frame * 48.0),
+            Vec3::new(0.0, -0.1, 512.0),
+        ),
+        CameraPath::Static => (Vec3::new(0.0, 72.0, -96.0), Vec3::new(0.0, -0.1, 512.0)),
+        CameraPath::SlowInChunkDrift => {
+            let yaw = frame * 0.01;
+            (
+                Vec3::new(
+                    (frame * 0.07).sin() * 12.0,
+                    72.0 + (frame * 0.03).sin() * 2.0,
+                    -80.0 + (frame * 0.05).cos() * 12.0,
+                ),
+                Vec3::new(yaw.sin() * 512.0, -0.1, yaw.cos() * 512.0),
+            )
         }
-        CameraPath::Static => Vec3::new(0.0, 72.0, -96.0),
         CameraPath::LodOscillation => {
             let z = 128.0 + (frame * 0.42).sin() * 144.0;
-            Vec3::new(0.0, 64.0, z)
+            (Vec3::new(0.0, 64.0, z), Vec3::new(0.0, -0.1, 512.0))
         }
         CameraPath::DespawnJump => {
             let jump = ((control.frame / 12) % 2) as f32;
-            Vec3::new(jump * 2_400.0, 64.0, -128.0 + frame * 4.0)
+            (
+                Vec3::new(jump * 2_400.0, 64.0, -128.0 + frame * 4.0),
+                Vec3::new(0.0, -0.1, 512.0),
+            )
         }
     };
 
-    *transform = Transform::from_translation(position)
-        .looking_at(position + Vec3::new(0.0, -0.1, 512.0), Vec3::Y);
+    *transform =
+        Transform::from_translation(position).looking_at(position + look_offset, Vec3::Y);
 }
 
 fn issue_voxel_writes(
@@ -666,6 +687,12 @@ fn collect_stats(
 
     if diagnostics.spawn_cap_hit {
         stats.spawn_cap_hit_diag_frames += 1;
+    }
+    if diagnostics.spawn_candidate_queue_limit_hit {
+        stats.spawn_candidate_queue_limit_hit_frames += 1;
+    }
+    if diagnostics.spawn_ray_step_budget_hit {
+        stats.spawn_ray_step_budget_hit_frames += 1;
     }
     if diagnostics.despawn_cap_hit {
         stats.despawn_cap_hit_diag_frames += 1;
@@ -872,6 +899,8 @@ fn print_reports(group: &str, scenarios: Vec<BenchScenario>) {
             "spawn_existing_chunks",
             "spawn_admitted",
             "spawn_cap_hit_diag_frames",
+            "spawn_candidate_queue_limit_hit_frames",
+            "spawn_ray_step_budget_hit_frames",
             "spawn_low_priority_promoted",
             "lod_chunks_scanned",
             "lod_high_priority",
@@ -989,6 +1018,8 @@ fn print_reports(group: &str, scenarios: Vec<BenchScenario>) {
             stats.spawn_existing_chunks.to_string(),
             stats.spawn_admitted.to_string(),
             stats.spawn_cap_hit_diag_frames.to_string(),
+            stats.spawn_candidate_queue_limit_hit_frames.to_string(),
+            stats.spawn_ray_step_budget_hit_frames.to_string(),
             stats.spawn_low_priority_promoted.to_string(),
             stats.lod_chunks_scanned.to_string(),
             stats.lod_high_priority.to_string(),
@@ -1094,6 +1125,14 @@ fn distance_128_single_voxel() -> BenchScenario {
     }
 }
 
+fn distance_250_single_voxel() -> BenchScenario {
+    BenchScenario {
+        name: "distance_250_single_voxel_delta_load",
+        spawning_distance: 250,
+        ..distance_128_single_voxel()
+    }
+}
+
 fn mesh_cache_lifecycle(name: &'static str, world: WorldShape) -> BenchScenario {
     BenchScenario {
         name,
@@ -1177,6 +1216,27 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 120,
             world: WorldShape::SingleVoxelPerChunk,
             camera_path: CameraPath::Static,
+            writes: WriteLoad::None,
+            spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
+            despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
+            spawning_distance: 96,
+            min_despawn_distance: 4,
+            spawning_rays: 2_048,
+            max_spawn_per_frame: 8_192,
+            max_active_chunk_threads: 8_192,
+            max_chunk_despawns_per_frame: usize::MAX,
+            retire_chunks_interval: Duration::ZERO,
+            chunk_lod_update_interval: Duration::ZERO,
+            lod_profile: LodProfile::Relaxed128,
+            generation_work: 0,
+            attach_chunks_to_root: false,
+        },
+        BenchScenario {
+            name: "slow_in_chunk_camera_long_view",
+            frames: 90,
+            warmup_frames: 120,
+            world: WorldShape::SingleVoxelPerChunk,
+            camera_path: CameraPath::SlowInChunkDrift,
             writes: WriteLoad::None,
             spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
             despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1335,6 +1395,8 @@ fn scenarios() -> Vec<BenchScenario> {
 
 fn knob_scenarios() -> Vec<BenchScenario> {
     let fast = base_fast_camera();
+    let d128 = distance_128_single_voxel();
+    let d250 = distance_250_single_voxel();
     let despawn = BenchScenario {
         name: "despawn_pressure_jump",
         frames: 96,
@@ -1402,6 +1464,206 @@ fn knob_scenarios() -> Vec<BenchScenario> {
     };
 
     vec![
+        BenchScenario {
+            name: "ray_sweep_fast_4",
+            spawning_rays: 4,
+            ..fast
+        },
+        BenchScenario {
+            name: "ray_sweep_fast_8",
+            spawning_rays: 8,
+            ..fast
+        },
+        BenchScenario {
+            name: "ray_sweep_fast_12",
+            spawning_rays: 12,
+            ..fast
+        },
+        BenchScenario {
+            name: "ray_sweep_fast_16",
+            spawning_rays: 16,
+            ..fast
+        },
+        BenchScenario {
+            name: "ray_sweep_fast_32",
+            spawning_rays: 32,
+            ..fast
+        },
+        BenchScenario {
+            name: "ray_sweep_fast_64",
+            spawning_rays: 64,
+            ..fast
+        },
+        BenchScenario {
+            name: "ray_sweep_fast_96",
+            spawning_rays: 96,
+            ..fast
+        },
+        BenchScenario {
+            name: "ray_sweep_fast_128",
+            spawning_rays: 128,
+            ..fast
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_64",
+            spawning_rays: 64,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_72",
+            spawning_rays: 72,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_80",
+            spawning_rays: 80,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_88",
+            spawning_rays: 88,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_96",
+            spawning_rays: 96,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_104",
+            spawning_rays: 104,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_112",
+            spawning_rays: 112,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_120",
+            spawning_rays: 120,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_128",
+            spawning_rays: 128,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_192",
+            spawning_rays: 192,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_256",
+            spawning_rays: 256,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_384",
+            spawning_rays: 384,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_512",
+            spawning_rays: 512,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_768",
+            spawning_rays: 768,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d128_1024",
+            spawning_rays: 1_024,
+            ..d128
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_16",
+            spawning_rays: 16,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_24",
+            spawning_rays: 24,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_32",
+            spawning_rays: 32,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_40",
+            spawning_rays: 40,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_48",
+            spawning_rays: 48,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_64",
+            spawning_rays: 64,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_72",
+            spawning_rays: 72,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_80",
+            spawning_rays: 80,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_88",
+            spawning_rays: 88,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_96",
+            spawning_rays: 96,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_128",
+            spawning_rays: 128,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_192",
+            spawning_rays: 192,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_256",
+            spawning_rays: 256,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_384",
+            spawning_rays: 384,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_512",
+            spawning_rays: 512,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_768",
+            spawning_rays: 768,
+            ..d250
+        },
+        BenchScenario {
+            name: "ray_sweep_d250_1024",
+            spawning_rays: 1_024,
+            ..d250
+        },
         BenchScenario {
             name: "spawn_cap_64",
             max_spawn_per_frame: 64,

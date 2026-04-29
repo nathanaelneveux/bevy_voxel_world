@@ -105,6 +105,8 @@ pub struct VoxelWorldDiagnosticsFrame {
     pub spawn_existing_chunks: u64,
     pub spawn_admitted: u64,
     pub spawn_cap_hit: bool,
+    pub spawn_candidate_queue_limit_hit: bool,
+    pub spawn_ray_step_budget_hit: bool,
     pub spawn_low_priority_promoted: u64,
     pub spawn_chunk_map_lock_miss: bool,
     pub lod_chunks_scanned: u64,
@@ -234,15 +236,22 @@ where
         let candidate_queue_limit = if max_spawn_per_frame == usize::MAX {
             usize::MAX
         } else {
-            max_spawn_per_frame
-                .saturating_mul(2)
-                .max(configuration.spawning_rays())
+            // Keep enough slack for duplicate and culled ray hits without letting
+            // the candidate queue grow far beyond what this frame can spawn.
+            let distance_scale = (spawning_distance as usize).div_ceil(128).max(1);
+            let distance_queue_slack =
+                max_spawn_per_frame.saturating_mul(distance_scale.saturating_sub(1));
+            max_spawn_per_frame.saturating_add(
+                (max_spawn_per_frame / 4)
+                    .max(configuration.spawning_rays())
+                    .max(distance_queue_slack),
+            )
         };
         let mut spawn_ray_step_budget = if max_spawn_per_frame == usize::MAX {
             usize::MAX
         } else {
-            max_spawn_per_frame
-                .saturating_mul(4)
+            candidate_queue_limit
+                .saturating_mul(2)
                 .max(configuration.spawning_rays())
         };
         let mut diagnostics_frame = VoxelWorldDiagnosticsFrame {
@@ -276,15 +285,45 @@ where
                 let Ok(ray) = camera.viewport_to_world(cam_gtf, point) else {
                     return;
                 };
-                let mut current = ray.origin;
+                let max_t = (spawning_distance * CHUNK_SIZE_I) as f32;
+                let mut chunk_pos = world_position_to_chunk_position(ray.origin);
+                let step = IVec3::new(
+                    axis_step(ray.direction.x),
+                    axis_step(ray.direction.y),
+                    axis_step(ray.direction.z),
+                );
+                let mut t_max = Vec3::new(
+                    initial_chunk_boundary_t(
+                        ray.origin.x,
+                        ray.direction.x,
+                        chunk_pos.x,
+                        step.x,
+                    ),
+                    initial_chunk_boundary_t(
+                        ray.origin.y,
+                        ray.direction.y,
+                        chunk_pos.y,
+                        step.y,
+                    ),
+                    initial_chunk_boundary_t(
+                        ray.origin.z,
+                        ray.direction.z,
+                        chunk_pos.z,
+                        step.z,
+                    ),
+                );
+                let t_delta = Vec3::new(
+                    chunk_t_delta(ray.direction.x),
+                    chunk_t_delta(ray.direction.y),
+                    chunk_t_delta(ray.direction.z),
+                );
                 let mut t = 0.0;
-                while t < (spawning_distance * CHUNK_SIZE_I) as f32
+                while t < max_t
                     && queue.len() < candidate_queue_limit
                     && *ray_step_budget > 0
                 {
                     *ray_step_budget -= 1;
                     diagnostics_frame.spawn_ray_steps += 1;
-                    let chunk_pos = current.as_ivec3() / CHUNK_SIZE_I;
                     if let Some(chunk) = ChunkMap::<C, C::MaterialIndex>::get_ref(
                         &chunk_pos,
                         &chunk_map_read_lock,
@@ -298,8 +337,32 @@ where
                         diagnostics_frame.spawn_candidates += 1;
                         queue.push_back(chunk_pos);
                     }
-                    t += CHUNK_SIZE_F;
-                    current = ray.origin + ray.direction * t;
+
+                    let next_t = t_max.x.min(t_max.y).min(t_max.z);
+                    if !next_t.is_finite() {
+                        break;
+                    }
+
+                    const AXIS_EPSILON: f32 = 0.0001;
+                    if t_max.x <= next_t + AXIS_EPSILON {
+                        chunk_pos.x += step.x;
+                        t_max.x += t_delta.x;
+                    }
+                    if t_max.y <= next_t + AXIS_EPSILON {
+                        chunk_pos.y += step.y;
+                        t_max.y += t_delta.y;
+                    }
+                    if t_max.z <= next_t + AXIS_EPSILON {
+                        chunk_pos.z += step.z;
+                        t_max.z += t_delta.z;
+                    }
+                    t = next_t;
+                }
+                if queue.len() >= candidate_queue_limit {
+                    diagnostics_frame.spawn_candidate_queue_limit_hit = true;
+                }
+                if *ray_step_budget == 0 {
+                    diagnostics_frame.spawn_ray_step_budget_hit = true;
                 }
             };
 
@@ -308,6 +371,9 @@ where
         let collect_candidates_start = diagnostics_enabled.then(Instant::now);
         for _ in 0..configuration.spawning_rays() {
             if chunks_deque.len() >= candidate_queue_limit || spawn_ray_step_budget == 0 {
+                diagnostics_frame.spawn_candidate_queue_limit_hit |=
+                    chunks_deque.len() >= candidate_queue_limit;
+                diagnostics_frame.spawn_ray_step_budget_hit |= spawn_ray_step_budget == 0;
                 break;
             }
             let random_point_in_viewport = {
@@ -454,6 +520,10 @@ where
                 diagnostics_frame.spawn_existing_chunks;
             diagnostics.frame.spawn_admitted = diagnostics_frame.spawn_admitted;
             diagnostics.frame.spawn_cap_hit = diagnostics_frame.spawn_cap_hit;
+            diagnostics.frame.spawn_candidate_queue_limit_hit =
+                diagnostics_frame.spawn_candidate_queue_limit_hit;
+            diagnostics.frame.spawn_ray_step_budget_hit =
+                diagnostics_frame.spawn_ray_step_budget_hit;
             diagnostics.frame.spawn_low_priority_promoted =
                 diagnostics_frame.spawn_low_priority_promoted;
         }
@@ -1056,6 +1126,56 @@ where
 
 const SQRT_3: f32 = 1.732_050_8;
 const CHUNK_BOUNDING_SPHERE_RADIUS: f32 = 0.5 * CHUNK_SIZE_F * SQRT_3;
+
+#[inline]
+fn world_position_to_chunk_position(position: Vec3) -> IVec3 {
+    IVec3::new(
+        (position.x / CHUNK_SIZE_F).floor() as i32,
+        (position.y / CHUNK_SIZE_F).floor() as i32,
+        (position.z / CHUNK_SIZE_F).floor() as i32,
+    )
+}
+
+#[inline]
+fn axis_step(direction: f32) -> i32 {
+    if direction > 0.0 {
+        1
+    } else if direction < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn initial_chunk_boundary_t(
+    origin: f32,
+    direction: f32,
+    chunk_coordinate: i32,
+    step: i32,
+) -> f32 {
+    if step == 0 {
+        return f32::INFINITY;
+    }
+
+    let next_chunk_boundary = if step > 0 {
+        chunk_coordinate + 1
+    } else {
+        chunk_coordinate
+    } as f32
+        * CHUNK_SIZE_F;
+
+    (next_chunk_boundary - origin) / direction
+}
+
+#[inline]
+fn chunk_t_delta(direction: f32) -> f32 {
+    if direction == 0.0 {
+        f32::INFINITY
+    } else {
+        CHUNK_SIZE_F / direction.abs()
+    }
+}
 
 enum ChunkVisibilityVolume<'a> {
     Perspective {
