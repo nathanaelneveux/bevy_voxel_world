@@ -232,7 +232,8 @@ where
         let max_spawn_per_frame = configuration.max_spawn_per_frame();
 
         let viewport_size = camera.physical_viewport_size().unwrap_or_default();
-        let visibility_margin = 0.0f32;
+        let visibility_margin =
+            viewport_margin_to_ndc(viewport_size, configuration.spawning_ray_margin());
         let protected_chunk_radius_sq =
             (configuration.min_despawn_distance() as i32).pow(2);
 
@@ -664,12 +665,15 @@ where
             return;
         }
 
-        let Ok((_, cam_gtf, projection, frustum)) = camera_info.single() else {
+        let Ok((camera, cam_gtf, projection, frustum)) = camera_info.single() else {
             return;
         };
 
         let camera_position = cam_gtf.translation();
         let visibility = ChunkVisibilityVolume::new(cam_gtf, projection, frustum);
+        let viewport_size = camera.physical_viewport_size().unwrap_or_default();
+        let visibility_margin =
+            viewport_margin_to_ndc(viewport_size, configuration.spawning_ray_margin());
         let cam_pos = camera_position.as_ivec3();
         let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
         let spawning_distance = configuration.spawning_distance() as i32;
@@ -694,7 +698,7 @@ where
                         false
                     } else {
                         frustum_checks += 1;
-                        !visibility.contains_chunk(chunk.position, 0.0)
+                        !visibility.contains_chunk(chunk.position, visibility_margin)
                     }
                 }
             };
@@ -1216,6 +1220,19 @@ fn chunk_t_delta(direction: f32) -> f32 {
     }
 }
 
+#[inline]
+fn viewport_margin_to_ndc(viewport_size: UVec2, margin: u32) -> Vec2 {
+    if margin == 0 || viewport_size.x == 0 || viewport_size.y == 0 {
+        return Vec2::ZERO;
+    }
+
+    let margin = margin as f32 * 2.0;
+    Vec2::new(
+        margin / viewport_size.x as f32,
+        margin / viewport_size.y as f32,
+    )
+}
+
 enum ChunkVisibilityVolume<'a> {
     Perspective {
         origin: Vec3,
@@ -1255,10 +1272,10 @@ impl<'a> ChunkVisibilityVolume<'a> {
     }
 
     #[inline]
-    fn contains_chunk(&self, chunk_position: IVec3, ndc_margin: f32) -> bool {
+    fn contains_chunk(&self, chunk_position: IVec3, ndc_margin: Vec2) -> bool {
         let chunk_min = chunk_position.as_vec3() * CHUNK_SIZE_F;
         let chunk_center = chunk_min + Vec3::splat(CHUNK_SIZE_F * 0.5);
-        let radius = CHUNK_BOUNDING_SPHERE_RADIUS + ndc_margin * CHUNK_SIZE_F;
+        let radius = CHUNK_BOUNDING_SPHERE_RADIUS;
 
         match self {
             Self::Perspective {
@@ -1277,15 +1294,18 @@ impl<'a> ChunkVisibilityVolume<'a> {
                     return false;
                 }
 
-                let max_x = depth.max(0.0) * *tan_half_fov_x + radius;
+                let max_x =
+                    depth.max(0.0) * *tan_half_fov_x * (1.0 + ndc_margin.x) + radius;
                 if to_chunk.dot(*right).abs() > max_x {
                     return false;
                 }
 
-                let max_y = depth.max(0.0) * *tan_half_fov_y + radius;
+                let max_y =
+                    depth.max(0.0) * *tan_half_fov_y * (1.0 + ndc_margin.y) + radius;
                 to_chunk.dot(*up).abs() <= max_y
             }
             Self::Frustum(frustum) => {
+                let radius = radius + ndc_margin.max_element() * CHUNK_SIZE_F;
                 let sphere = Sphere {
                     center: Vec3A::from(chunk_center),
                     radius,
