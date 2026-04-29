@@ -82,6 +82,12 @@ pub(crate) struct Internals<C>(PhantomData<C>);
 #[derive(Component)]
 pub struct WorldRoot<C>(PhantomData<C>);
 
+#[derive(Default)]
+pub(crate) struct SpawnChunkScratch {
+    visited: HashSet<IVec3>,
+    chunks_deque: VecDeque<(IVec3, bool)>,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct VoxelWorldDiagnosticsFrame {
     pub spawn_chunks_us: u64,
@@ -205,6 +211,7 @@ where
         chunk_low_priority: Query<(), With<NeedsRemeshLowPriority>>,
         configuration: Res<C>,
         camera_info: CameraInfo<C>,
+        mut scratch: Local<SpawnChunkScratch>,
     ) {
         let diagnostics_enabled = configuration.diagnostics_enabled();
         let diagnostics_start = diagnostics_enabled.then(Instant::now);
@@ -257,8 +264,32 @@ where
         } else {
             candidate_queue_limit
         };
-        let mut visited = HashSet::with_capacity(queue_capacity);
-        let mut chunks_deque = VecDeque::with_capacity(queue_capacity);
+        scratch.visited.clear();
+        let visited_capacity = scratch.visited.capacity();
+        if visited_capacity < queue_capacity {
+            scratch.visited.reserve(queue_capacity - visited_capacity);
+        }
+        let carryover_limit = if max_spawn_per_frame == usize::MAX {
+            queue_capacity
+        } else {
+            queue_capacity.min(max_spawn_per_frame)
+        };
+        while scratch.chunks_deque.len() > carryover_limit {
+            scratch.chunks_deque.pop_back();
+        }
+        for (_, known_missing_chunk) in scratch.chunks_deque.iter_mut() {
+            *known_missing_chunk = false;
+        }
+        let chunks_deque_capacity = scratch.chunks_deque.capacity();
+        if chunks_deque_capacity < queue_capacity {
+            scratch
+                .chunks_deque
+                .reserve(queue_capacity - chunks_deque_capacity);
+        }
+        let SpawnChunkScratch {
+            visited,
+            chunks_deque,
+        } = &mut *scratch;
         let mut diagnostics_frame = VoxelWorldDiagnosticsFrame {
             spawn_rays: configuration.spawning_rays() as u64,
             ..default()
@@ -286,7 +317,9 @@ where
 
         // Shoots a ray from the given point, and queue all (non-spawned) chunks intersecting the ray
         let mut queue_chunks_intersecting_ray_from_point =
-            |point: Vec2, queue: &mut VecDeque<IVec3>, ray_step_budget: &mut usize| {
+            |point: Vec2,
+             queue: &mut VecDeque<(IVec3, bool)>,
+             ray_step_budget: &mut usize| {
                 let Ok(ray) = camera.viewport_to_world(cam_gtf, point) else {
                     return;
                 };
@@ -340,7 +373,7 @@ where
                         }
                     } else {
                         diagnostics_frame.spawn_candidates += 1;
-                        queue.push_back(chunk_pos);
+                        queue.push_back((chunk_pos, true));
                     }
 
                     let next_t = t_max.x.min(t_max.y).min(t_max.z);
@@ -392,7 +425,7 @@ where
             // Then, for each point, we cast a ray, picking up any unspawned chunks along the ray
             queue_chunks_intersecting_ray_from_point(
                 random_point_in_viewport,
-                &mut chunks_deque,
+                chunks_deque,
                 &mut spawn_ray_step_budget,
             );
         }
@@ -408,14 +441,14 @@ where
             for y in -distance..=distance {
                 for z in -distance..=distance {
                     let queue_pos = chunk_at_camera + IVec3::new(x, y, z);
-                    chunks_deque.push_front(queue_pos);
+                    chunks_deque.push_front((queue_pos, false));
                 }
             }
         }
 
         // Then, when we have a queue of chunks, we can set them up for spawning
         let mut spawned_this_frame = 0;
-        while let Some(chunk_position) = chunks_deque.pop_front() {
+        while let Some((chunk_position, known_missing_chunk)) = chunks_deque.pop_front() {
             if spawned_this_frame >= max_spawn_per_frame {
                 diagnostics_frame.spawn_cap_hit = true;
                 break;
@@ -440,10 +473,11 @@ where
                 }
             }
 
-            let has_chunk = ChunkMap::<C, C::MaterialIndex>::contains_chunk(
-                &chunk_position,
-                &chunk_map_read_lock,
-            );
+            let has_chunk = !known_missing_chunk
+                && ChunkMap::<C, C::MaterialIndex>::contains_chunk(
+                    &chunk_position,
+                    &chunk_map_read_lock,
+                );
 
             if !has_chunk {
                 let translation = Transform::from_translation(
@@ -492,7 +526,7 @@ where
                         if queue_pos == chunk_position {
                             continue;
                         }
-                        chunks_deque.push_back(queue_pos);
+                        chunks_deque.push_back((queue_pos, false));
                     }
                 }
             }
