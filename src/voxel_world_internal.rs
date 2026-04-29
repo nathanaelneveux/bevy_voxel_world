@@ -229,10 +229,6 @@ where
         let protected_chunk_radius_sq =
             (configuration.min_despawn_distance() as i32).pow(2);
 
-        let mut visited = HashSet::new();
-        let mut chunks_deque = VecDeque::with_capacity(
-            configuration.spawning_rays() * spawning_distance as usize,
-        );
         let candidate_queue_limit = if max_spawn_per_frame == usize::MAX {
             usize::MAX
         } else {
@@ -254,6 +250,15 @@ where
                 .saturating_mul(2)
                 .max(configuration.spawning_rays())
         };
+        let queue_capacity = if candidate_queue_limit == usize::MAX {
+            configuration
+                .spawning_rays()
+                .saturating_mul(spawning_distance as usize)
+        } else {
+            candidate_queue_limit
+        };
+        let mut visited = HashSet::with_capacity(queue_capacity);
+        let mut chunks_deque = VecDeque::with_capacity(queue_capacity);
         let mut diagnostics_frame = VoxelWorldDiagnosticsFrame {
             spawn_rays: configuration.spawning_rays() as u64,
             ..default()
