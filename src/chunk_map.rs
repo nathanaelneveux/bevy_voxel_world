@@ -94,12 +94,12 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         update_buffer: &mut ChunkMapUpdateBuffer<C, I>,
         remove_buffer: &mut ChunkMapRemoveBuffer<C>,
         ev_chunk_will_spawn: &mut MessageWriter<ChunkWillSpawn<C>>,
-    ) {
+    ) -> bool {
         if insert_buffer.is_empty()
             && update_buffer.is_empty()
             && remove_buffer.is_empty()
         {
-            return;
+            return false;
         }
 
         if let Ok(mut write_lock) = self.map.try_write() {
@@ -131,8 +131,9 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
             for position in remove_buffer.drain(..) {
                 write_lock.data.remove(&position);
 
-                need_rebuild_aabb |= write_lock.bounds.min.floor().as_ivec3() == position
-                    || write_lock.bounds.max.floor().as_ivec3() == position;
+                let position_f = Vec3A::from(position.as_vec3());
+                need_rebuild_aabb |= position_f.cmpeq(write_lock.bounds.min).any()
+                    || position_f.cmpeq(write_lock.bounds.max).any();
             }
 
             if need_rebuild_aabb {
@@ -149,6 +150,10 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
                     );
                 }
             }
+
+            need_rebuild_aabb
+        } else {
+            false
         }
     }
 }

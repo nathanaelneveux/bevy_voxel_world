@@ -53,6 +53,7 @@ enum WorldShape {
     DenseOccluding,
     FlatTerrain,
     SingleVoxelPerChunk,
+    UniqueVoxelPerChunk,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -172,10 +173,14 @@ struct BenchStats {
     remesh_cap_hit_frames: u64,
     chunk_threads_polled: u64,
     chunk_threads_completed: u64,
+    mesh_cache_hits: u64,
+    mesh_cache_misses: u64,
+    mesh_cache_stores: u64,
     chunk_map_updates_queued: u64,
     chunk_map_inserts_flushed: u64,
     chunk_map_updates_flushed: u64,
     chunk_map_removes_flushed: u64,
+    chunk_map_bounds_rebuilt: u64,
 }
 
 impl Default for BenchWorld {
@@ -314,6 +319,9 @@ impl VoxelWorldConfig for BenchWorld {
                     WorldShape::AsteroidField => asteroid_voxel(chunk_pos, world_pos),
                     WorldShape::SingleVoxelPerChunk => {
                         single_voxel_chunk(chunk_pos, world_pos)
+                    }
+                    WorldShape::UniqueVoxelPerChunk => {
+                        unique_voxel_chunk(chunk_pos, world_pos)
                     }
                 }
             })
@@ -647,10 +655,14 @@ fn collect_stats(
     stats.remesh_started += diagnostics.remesh_started;
     stats.chunk_threads_polled += diagnostics.chunk_threads_polled;
     stats.chunk_threads_completed += diagnostics.chunk_threads_completed;
+    stats.mesh_cache_hits += diagnostics.mesh_cache_hits;
+    stats.mesh_cache_misses += diagnostics.mesh_cache_misses;
+    stats.mesh_cache_stores += diagnostics.mesh_cache_stores;
     stats.chunk_map_updates_queued += diagnostics.chunk_map_updates_queued;
     stats.chunk_map_inserts_flushed += diagnostics.chunk_map_inserts_flushed;
     stats.chunk_map_updates_flushed += diagnostics.chunk_map_updates_flushed;
     stats.chunk_map_removes_flushed += diagnostics.chunk_map_removes_flushed;
+    stats.chunk_map_bounds_rebuilt += diagnostics.chunk_map_bounds_rebuilt;
 
     if diagnostics.spawn_cap_hit {
         stats.spawn_cap_hit_diag_frames += 1;
@@ -762,6 +774,23 @@ fn single_voxel_chunk(chunk_pos: IVec3, world_pos: IVec3) -> WorldVoxel<u8> {
     }
 }
 
+fn unique_voxel_chunk(chunk_pos: IVec3, world_pos: IVec3) -> WorldVoxel<u8> {
+    let origin = chunk_pos * CHUNK_SIZE_I;
+    let local = world_pos - origin;
+    let chunk_hash = hash_ivec3(chunk_pos);
+    let target = IVec3::new(
+        2 + ((chunk_hash >> 3) % 28) as i32,
+        2 + ((chunk_hash >> 11) % 28) as i32,
+        2 + ((chunk_hash >> 19) % 28) as i32,
+    );
+
+    if local == target {
+        WorldVoxel::Solid(1 + (chunk_hash & 7) as u8)
+    } else {
+        WorldVoxel::Air
+    }
+}
+
 fn burn_cpu(chunk_pos: IVec3, world_pos: IVec3, iterations: u32) {
     let mut x = hash_ivec3(chunk_pos) ^ hash_ivec3(world_pos);
     for _ in 0..iterations {
@@ -863,10 +892,14 @@ fn print_reports(group: &str, scenarios: Vec<BenchScenario>) {
             "remesh_cap_hit_frames",
             "chunk_threads_polled",
             "chunk_threads_completed",
+            "mesh_cache_hits",
+            "mesh_cache_misses",
+            "mesh_cache_stores",
             "chunk_map_updates_queued",
             "chunk_map_inserts_flushed",
             "chunk_map_updates_flushed",
             "chunk_map_removes_flushed",
+            "chunk_map_bounds_rebuilt",
         ]
         .join(",")
     );
@@ -976,10 +1009,14 @@ fn print_reports(group: &str, scenarios: Vec<BenchScenario>) {
             stats.remesh_cap_hit_frames.to_string(),
             stats.chunk_threads_polled.to_string(),
             stats.chunk_threads_completed.to_string(),
+            stats.mesh_cache_hits.to_string(),
+            stats.mesh_cache_misses.to_string(),
+            stats.mesh_cache_stores.to_string(),
             stats.chunk_map_updates_queued.to_string(),
             stats.chunk_map_inserts_flushed.to_string(),
             stats.chunk_map_updates_flushed.to_string(),
             stats.chunk_map_removes_flushed.to_string(),
+            stats.chunk_map_bounds_rebuilt.to_string(),
         ];
         eprintln!("{}", row.join(","));
     }
@@ -1057,6 +1094,30 @@ fn distance_128_single_voxel() -> BenchScenario {
     }
 }
 
+fn mesh_cache_lifecycle(name: &'static str, world: WorldShape) -> BenchScenario {
+    BenchScenario {
+        name,
+        frames: 60,
+        warmup_frames: 0,
+        world,
+        camera_path: CameraPath::Static,
+        writes: WriteLoad::None,
+        spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
+        despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
+        spawning_distance: 64,
+        min_despawn_distance: 4,
+        spawning_rays: 512,
+        max_spawn_per_frame: 4_096,
+        max_active_chunk_threads: 4_096,
+        max_chunk_despawns_per_frame: usize::MAX,
+        retire_chunks_interval: Duration::ZERO,
+        chunk_lod_update_interval: Duration::ZERO,
+        lod_profile: LodProfile::Off,
+        generation_work: 0,
+        attach_chunks_to_root: false,
+    }
+}
+
 fn scenarios() -> Vec<BenchScenario> {
     vec![
         base_fast_camera(),
@@ -1128,6 +1189,35 @@ fn scenarios() -> Vec<BenchScenario> {
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
             lod_profile: LodProfile::Relaxed128,
+            generation_work: 0,
+            attach_chunks_to_root: false,
+        },
+        mesh_cache_lifecycle(
+            "mesh_cache_repeated_hash_lifecycle",
+            WorldShape::SingleVoxelPerChunk,
+        ),
+        mesh_cache_lifecycle(
+            "mesh_cache_unique_hash_lifecycle",
+            WorldShape::UniqueVoxelPerChunk,
+        ),
+        BenchScenario {
+            name: "chunk_map_bounds_rebuild_pressure",
+            frames: 96,
+            warmup_frames: 24,
+            world: WorldShape::Empty,
+            camera_path: CameraPath::DespawnJump,
+            writes: WriteLoad::None,
+            spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
+            despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
+            spawning_distance: 56,
+            min_despawn_distance: 2,
+            spawning_rays: 256,
+            max_spawn_per_frame: 1_024,
+            max_active_chunk_threads: 1_024,
+            max_chunk_despawns_per_frame: usize::MAX,
+            retire_chunks_interval: Duration::ZERO,
+            chunk_lod_update_interval: Duration::ZERO,
+            lod_profile: LodProfile::Off,
             generation_work: 0,
             attach_chunks_to_root: false,
         },

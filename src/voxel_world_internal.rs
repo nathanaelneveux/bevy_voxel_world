@@ -127,10 +127,14 @@ pub struct VoxelWorldDiagnosticsFrame {
     pub remesh_cap_hit: bool,
     pub chunk_threads_polled: u64,
     pub chunk_threads_completed: u64,
+    pub mesh_cache_hits: u64,
+    pub mesh_cache_misses: u64,
+    pub mesh_cache_stores: u64,
     pub chunk_map_updates_queued: u64,
     pub chunk_map_inserts_flushed: u64,
     pub chunk_map_updates_flushed: u64,
     pub chunk_map_removes_flushed: u64,
+    pub chunk_map_bounds_rebuilt: u64,
 }
 
 #[derive(Resource, Clone)]
@@ -829,6 +833,9 @@ where
         let diagnostics_start = diagnostics_enabled.then(Instant::now);
         let mut polled = 0;
         let mut completed = 0;
+        let mut mesh_cache_hits = 0;
+        let mut mesh_cache_misses = 0;
+        let mut mesh_cache_stores = 0;
         let mut chunk_map_updates = 0;
         let (mesh_cache, loading_texture) = res;
 
@@ -855,6 +862,7 @@ where
                     let hash = chunk_task.voxels_hash();
                     let mesh_handle = {
                         if let Some(mesh_handle) = mesh_cache.get_mesh_handle(&hash) {
+                            mesh_cache_hits += 1;
                             let user_bundle = mesh_cache.get_user_bundle(&hash);
                             if let Some(user_bundle) = user_bundle.clone() {
                                 entity_commands.insert(user_bundle);
@@ -862,6 +870,7 @@ where
 
                             mesh_handle
                         } else {
+                            mesh_cache_misses += 1;
                             if chunk_task.mesh.is_none() {
                                 entity_commands
                                     .try_insert(NeedsRemesh)
@@ -878,6 +887,7 @@ where
                                 mesh_ref.clone(),
                                 user_bundle.clone(),
                             ));
+                            mesh_cache_stores += 1;
                             if let Some(bundle) = user_bundle {
                                 entity_commands.insert(bundle);
                             }
@@ -908,6 +918,9 @@ where
         if diagnostics_enabled {
             diagnostics.frame.chunk_threads_polled = polled;
             diagnostics.frame.chunk_threads_completed = completed;
+            diagnostics.frame.mesh_cache_hits = mesh_cache_hits;
+            diagnostics.frame.mesh_cache_misses = mesh_cache_misses;
+            diagnostics.frame.mesh_cache_stores = mesh_cache_stores;
             diagnostics.frame.chunk_map_updates_queued = chunk_map_updates;
             if let Some(start) = diagnostics_start {
                 diagnostics.frame.spawn_meshes_us = elapsed_micros(start);
@@ -1004,7 +1017,7 @@ where
         let inserts = chunk_map_insert_buffer.len() as u64;
         let updates = chunk_map_update_buffer.len() as u64;
         let removes = chunk_map_remove_buffer.len() as u64;
-        chunk_map.apply_buffers(
+        let bounds_rebuilt = chunk_map.apply_buffers(
             &mut chunk_map_insert_buffer,
             &mut chunk_map_update_buffer,
             &mut chunk_map_remove_buffer,
@@ -1014,6 +1027,7 @@ where
             diagnostics.frame.chunk_map_inserts_flushed = inserts;
             diagnostics.frame.chunk_map_updates_flushed = updates;
             diagnostics.frame.chunk_map_removes_flushed = removes;
+            diagnostics.frame.chunk_map_bounds_rebuilt = u64::from(bounds_rebuilt);
             if let Some(start) = diagnostics_start {
                 diagnostics.frame.flush_chunk_map_buffers_us = elapsed_micros(start);
             }
