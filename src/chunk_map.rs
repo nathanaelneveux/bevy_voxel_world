@@ -19,7 +19,8 @@ use hashbrown::HashMap;
 pub struct ChunkMapData<I> {
     #[deref]
     data: HashMap<IVec3, chunk::ChunkData<I>>,
-    bounds: Aabb3d,
+    min: IVec3,
+    max: IVec3,
     axis_counts: [HashMap<i32, usize>; 3],
 }
 
@@ -58,7 +59,10 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
     ///
     /// Expressed in **chunk coordinates**. Bounds are **inclusive**.
     pub fn get_bounds(read_lock: &RwLockReadGuard<ChunkMapData<I>>) -> Aabb3d {
-        read_lock.bounds
+        Aabb3d {
+            min: Vec3A::from(read_lock.min.as_vec3()),
+            max: Vec3A::from(read_lock.max.as_vec3()),
+        }
     }
 
     /// Get the current bounding box of loaded chunks in this map.
@@ -148,25 +152,19 @@ impl<I> ChunkMapData<I> {
         *self.axis_counts[1].entry(position.y).or_default() += 1;
         *self.axis_counts[2].entry(position.z).or_default() += 1;
 
-        let position_f = Vec3A::from(position.as_vec3());
         if first_position {
-            self.bounds.min = position_f;
-            self.bounds.max = position_f;
+            self.min = position;
+            self.max = position;
             return;
         }
 
-        if position_f.cmplt(self.bounds.min).any() {
-            self.bounds.min = position_f.min(self.bounds.min);
-        }
-        if position_f.cmpgt(self.bounds.max).any() {
-            self.bounds.max = position_f.max(self.bounds.max);
-        }
+        self.min = self.min.min(position);
+        self.max = self.max.max(position);
     }
 
     fn remove_position(&mut self, position: IVec3) -> bool {
-        let position_f = Vec3A::from(position.as_vec3());
-        let boundary_removed = position_f.cmpeq(self.bounds.min).any()
-            || position_f.cmpeq(self.bounds.max).any();
+        let boundary_removed =
+            position.cmpeq(self.min).any() || position.cmpeq(self.max).any();
 
         Self::decrement_axis_count(&mut self.axis_counts[0], position.x);
         Self::decrement_axis_count(&mut self.axis_counts[1], position.y);
@@ -187,15 +185,16 @@ impl<I> ChunkMapData<I> {
 
     fn rebuild_bounds_from_positions(&mut self) {
         let Some((min_x, max_x)) = Self::axis_bounds(&self.axis_counts[0]) else {
-            self.bounds = Aabb3d::new(Vec3::ZERO, Vec3::ZERO);
+            self.min = IVec3::ZERO;
+            self.max = IVec3::ZERO;
             return;
         };
 
         let (min_y, max_y) = Self::axis_bounds(&self.axis_counts[1]).unwrap();
         let (min_z, max_z) = Self::axis_bounds(&self.axis_counts[2]).unwrap();
 
-        self.bounds.min = Vec3A::new(min_x as f32, min_y as f32, min_z as f32);
-        self.bounds.max = Vec3A::new(max_x as f32, max_y as f32, max_z as f32);
+        self.min = IVec3::new(min_x, min_y, min_z);
+        self.max = IVec3::new(max_x, max_y, max_z);
     }
 
     fn axis_bounds(axis_counts: &HashMap<i32, usize>) -> Option<(i32, i32)> {
@@ -217,7 +216,8 @@ impl<C, I> Default for ChunkMap<C, I> {
         Self {
             map: Arc::new(RwLock::new(ChunkMapData {
                 data: HashMap::with_capacity(1000),
-                bounds: Aabb3d::new(Vec3::ZERO, Vec3::ZERO),
+                min: IVec3::ZERO,
+                max: IVec3::ZERO,
                 axis_counts: Default::default(),
             })),
             _marker: PhantomData,
