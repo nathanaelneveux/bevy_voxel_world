@@ -113,7 +113,10 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
             }
 
             for (position, chunk_data, evt) in update_buffer.drain(..) {
-                if write_lock.data.insert(position, chunk_data).is_none() {
+                if let Some(existing_chunk_data) = write_lock.data.get_mut(&position) {
+                    *existing_chunk_data = chunk_data;
+                } else {
+                    write_lock.data.insert(position, chunk_data);
                     write_lock.include_position_in_bounds(position);
                 }
 

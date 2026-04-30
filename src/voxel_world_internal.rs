@@ -762,22 +762,19 @@ where
                 for chunk in all_chunks.iter() {
                     scanned += 1;
                     let dist_squared = chunk.position.distance_squared(chunk_at_camera);
-                    let near_camera = dist_squared <= near_distance_squared;
+                    if dist_squared <= near_distance_squared {
+                        continue;
+                    }
                     let distance_culled = dist_squared > spawning_distance_squared + 1;
-                    let should_be_culled = if near_camera || distance_culled {
-                        false
-                    } else {
-                        frustum_checks += 1;
-                        !visibility.contains_chunk(chunk.position, visibility_margin)
-                    };
-
-                    if (should_be_culled && !near_camera) || distance_culled {
+                    if distance_culled
+                        || !visibility.contains_chunk(chunk.position, visibility_margin)
+                    {
                         marked += 1;
-                        if should_be_culled && !near_camera {
-                            frustum_culled_count += 1;
-                        }
                         if distance_culled {
                             distance_culled_count += 1;
+                        } else {
+                            frustum_checks += 1;
+                            frustum_culled_count += 1;
                         }
                         commands
                             .entity(chunk.entity)
@@ -788,6 +785,8 @@ where
                             chunk.position,
                             chunk.entity,
                         ));
+                    } else {
+                        frustum_checks += 1;
                     }
                 }
             }
@@ -895,6 +894,12 @@ where
             return;
         };
 
+        let regenerate_strategy = configuration.chunk_regenerate_strategy();
+        let voxel_lookup_delegate = configuration.voxel_lookup_delegate();
+        let chunk_meshing_delegate = configuration.chunk_meshing_delegate();
+        let texture_index_mapper = configuration.texture_index_mapper();
+        let mesh_map = mesh_cache.get_mesh_map();
+
         for chunk in dirty_chunks.iter().chain(dirty_chunks_low.iter()) {
             if active_threads >= max_threads {
                 if diagnostics_enabled {
@@ -910,25 +915,32 @@ where
 
             let lod_level = chunk.lod_level;
 
-            let regenerate_strategy = configuration.chunk_regenerate_strategy();
-
-            let voxel_data_fn = (configuration.voxel_lookup_delegate())(
+            let voxel_data_fn = voxel_lookup_delegate(
                 chunk.position,
                 lod_level,
                 previous_chunk_data.clone(),
             );
             let data_shape = chunk.data_shape;
             let mesh_shape = chunk.mesh_shape;
-            let chunk_meshing_fn = (configuration
-                .chunk_meshing_delegate()
-                .unwrap_or_else(|| Box::new(default_chunk_meshing_delegate)))(
-                chunk.position,
-                lod_level,
-                data_shape,
-                mesh_shape,
-                previous_chunk_data.clone(),
-            );
-            let texture_index_mapper = configuration.texture_index_mapper().clone();
+            let chunk_meshing_fn =
+                if let Some(chunk_meshing_delegate) = chunk_meshing_delegate.as_ref() {
+                    chunk_meshing_delegate(
+                        chunk.position,
+                        lod_level,
+                        data_shape,
+                        mesh_shape,
+                        previous_chunk_data.clone(),
+                    )
+                } else {
+                    default_chunk_meshing_delegate(
+                        chunk.position,
+                        lod_level,
+                        data_shape,
+                        mesh_shape,
+                        previous_chunk_data.clone(),
+                    )
+                };
+            let texture_index_mapper = texture_index_mapper.clone();
 
             let mut chunk_task = ChunkTask::<C, C::MaterialIndex>::new(
                 chunk.entity,
@@ -939,7 +951,7 @@ where
                 modified_voxels.clone(),
             );
 
-            let mesh_map = mesh_cache.get_mesh_map();
+            let mesh_map = mesh_map.clone();
 
             let thread = thread_pool.spawn(async move {
                 info_span!("chunk_generate").in_scope(|| {
@@ -999,12 +1011,7 @@ where
         mut commands: Commands,
         mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         mut chunking_threads: Query<
-            (
-                Entity,
-                &mut ChunkThread<C, C::MaterialIndex>,
-                &mut Chunk<C>,
-                &Transform,
-            ),
+            (Entity, &mut ChunkThread<C, C::MaterialIndex>, &mut Chunk<C>),
             Without<NeedsRemesh>,
         >,
         mut mesh_assets: ResMut<Assets<Mesh>>,
@@ -1032,7 +1039,7 @@ where
         let mesh_handles = mesh_cache.mesh_handles();
         let user_bundles = mesh_cache.user_bundles();
 
-        for (entity, mut thread, chunk, transform) in &mut chunking_threads {
+        for (entity, mut thread, chunk) in &mut chunking_threads {
             polled += 1;
             if !thread.0.is_finished() {
                 continue;
@@ -1080,7 +1087,6 @@ where
                     };
 
                     entity_commands.try_insert((
-                        *transform,
                         MeshRef(mesh_handle),
                         NeedsMaterial::<C>(PhantomData),
                     ));
@@ -1220,19 +1226,18 @@ where
 
     pub(crate) fn assign_material<M: Material>(
         mut commands: Commands,
-        mut needs_material: Query<(Entity, &MeshRef, &Transform), With<NeedsMaterial<C>>>,
+        mut needs_material: Query<(Entity, &MeshRef), With<NeedsMaterial<C>>>,
         material_handle: Option<Res<VoxelWorldMaterialHandle<M>>>,
     ) {
         let Some(material_handle) = material_handle else {
             return;
         };
 
-        for (entity, mesh_ref, transform) in needs_material.iter_mut() {
+        for (entity, mesh_ref) in needs_material.iter_mut() {
             commands
                 .entity(entity)
                 .insert(Mesh3d((*mesh_ref.0).clone()))
                 .insert(MeshMaterial3d(material_handle.handle.clone()))
-                .insert(*transform)
                 .remove::<NeedsMaterial<C>>();
         }
     }
