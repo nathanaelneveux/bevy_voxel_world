@@ -133,6 +133,9 @@ impl VoxelWorldConfig for MainWorld {
         _previous_lod: Option<LodLevel>,
         camera_position: Vec3,
     ) -> LodLevel {
+        if chunk_position.y < -1 || chunk_position.y > 4 {
+            return 32;
+        }
         let camera_chunk = (camera_position / CHUNK_SIZE_F).floor();
         let distance = chunk_position.as_vec3().distance(camera_chunk);
 
