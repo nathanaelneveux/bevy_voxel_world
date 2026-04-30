@@ -86,12 +86,44 @@ pub struct WorldRoot<C>(PhantomData<C>);
 pub(crate) struct SpawnChunkScratch {
     visited: HashSet<IVec3>,
     chunks_deque: VecDeque<SpawnCandidate>,
+    protected_offsets: Vec<IVec3>,
+    protected_offsets_distance: i32,
 }
 
 struct SpawnCandidate {
     position: IVec3,
     known_missing_chunk: bool,
     protected_chunk: bool,
+}
+
+impl SpawnChunkScratch {
+    fn protected_offsets(&mut self, distance: i32) -> &[IVec3] {
+        if self.protected_offsets_distance == distance
+            && !self.protected_offsets.is_empty()
+        {
+            return &self.protected_offsets;
+        }
+
+        self.protected_offsets.clear();
+        self.protected_offsets_distance = distance;
+
+        let distance_sq = distance * distance;
+        for x in -distance..=distance {
+            let x_sq = x * x;
+            let y_limit = ((distance_sq - x_sq) as f32).sqrt() as i32;
+
+            for y in -y_limit..=y_limit {
+                let y_sq = y * y;
+                let z_limit = ((distance_sq - x_sq - y_sq) as f32).sqrt() as i32;
+
+                for z in -z_limit..=z_limit {
+                    self.protected_offsets.push(IVec3::new(x, y, z));
+                }
+            }
+        }
+
+        &self.protected_offsets
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -234,6 +266,7 @@ where
 
         let spawning_distance = configuration.spawning_distance() as i32;
         let spawning_distance_squared = spawning_distance.pow(2);
+        let min_despawn_distance = configuration.min_despawn_distance() as i32;
         let spawn_strategy = configuration.chunk_spawn_strategy();
         let max_spawn_per_frame = configuration.max_spawn_per_frame();
 
@@ -291,9 +324,12 @@ where
                 .chunks_deque
                 .reserve(queue_capacity - chunks_deque_capacity);
         }
+        scratch.protected_offsets(min_despawn_distance);
         let SpawnChunkScratch {
             visited,
             chunks_deque,
+            protected_offsets,
+            ..
         } = &mut *scratch;
         let mut diagnostics_frame = VoxelWorldDiagnosticsFrame {
             spawn_rays: configuration.spawning_rays() as u64,
@@ -445,25 +481,12 @@ where
         // We also queue the chunks closest to the camera to make sure they will always spawn early
         let process_queue_start = diagnostics_enabled.then(Instant::now);
         let chunk_at_camera = cam_pos / CHUNK_SIZE_I;
-        let distance = configuration.min_despawn_distance() as i32;
-        let distance_sq = distance * distance;
-        for x in -distance..=distance {
-            let x_sq = x * x;
-            let y_limit = ((distance_sq - x_sq) as f32).sqrt() as i32;
-
-            for y in -y_limit..=y_limit {
-                let y_sq = y * y;
-                let z_limit = ((distance_sq - x_sq - y_sq) as f32).sqrt() as i32;
-
-                for z in -z_limit..=z_limit {
-                    let queue_pos = chunk_at_camera + IVec3::new(x, y, z);
-                    chunks_deque.push_front(SpawnCandidate {
-                        position: queue_pos,
-                        known_missing_chunk: false,
-                        protected_chunk: true,
-                    });
-                }
-            }
+        for offset in protected_offsets.iter() {
+            chunks_deque.push_front(SpawnCandidate {
+                position: chunk_at_camera + *offset,
+                known_missing_chunk: false,
+                protected_chunk: true,
+            });
         }
 
         // Then, when we have a queue of chunks, we can set them up for spawning

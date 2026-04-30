@@ -104,6 +104,8 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         }
 
         if let Ok(mut write_lock) = self.map.try_write() {
+            write_lock.data.reserve(insert_buffer.len());
+
             for (position, chunk_data) in insert_buffer.drain(..) {
                 if write_lock.data.insert(position, chunk_data).is_none() {
                     write_lock.include_position_in_bounds(position);
