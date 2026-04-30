@@ -1029,27 +1029,26 @@ where
         }
 
         let (mut chunk_map_update_buffer, mut mesh_cache_insert_buffer) = buffers;
+        let mesh_handles = mesh_cache.mesh_handles();
+        let user_bundles = mesh_cache.user_bundles();
 
         for (entity, mut thread, chunk, transform) in &mut chunking_threads {
             polled += 1;
-            let thread_result = future::block_on(future::poll_once(&mut thread.0));
-
-            if thread_result.is_none() {
+            if !thread.0.is_finished() {
                 continue;
             }
             completed += 1;
 
-            let chunk_task = thread_result.unwrap();
+            let chunk_task = future::block_on(&mut thread.0);
             let mut entity_commands = commands.entity(entity);
 
             if !chunk_task.is_empty() {
                 if !chunk_task.is_full() {
                     let hash = chunk_task.voxels_hash();
                     let mesh_handle = {
-                        if let Some(mesh_handle) = mesh_cache.get_mesh_handle(&hash) {
+                        if let Some(mesh_handle) = mesh_handles.get(&hash) {
                             mesh_cache_hits += 1;
-                            let user_bundle = mesh_cache.get_user_bundle(&hash);
-                            if let Some(user_bundle) = user_bundle.clone() {
+                            if let Some(user_bundle) = user_bundles.get(&hash).cloned() {
                                 entity_commands.insert(user_bundle);
                             }
 
