@@ -435,65 +435,80 @@ impl<C: VoxelWorldConfig + Send + Sync + 'static, I: Hash + Copy + Eq> ChunkTask
         let mut voxels = vec![WorldVoxel::Unset; data_shape_size as usize];
 
         let scale = voxel_size_from_shape(&data_shape);
+        let chunk_origin = self.position * CHUNK_SIZE_I;
+        let has_modified_voxels = !modified_voxels.is_empty();
+        let has_previous_data = previous_data_ref.is_some();
 
         self.chunk_data.has_generated = true;
 
-        for i in 0..data_shape_size {
-            let idx = i as usize;
-            let chunk_block = data_shape.delinearize(i);
+        let mut idx = 0;
+        for z in 0..active_shape.z {
+            let world_z = ((z as f32 - 1.0) * scale.z) as i32 + chunk_origin.z;
+            for y in 0..active_shape.y {
+                let world_y = ((y as f32 - 1.0) * scale.y) as i32 + chunk_origin.y;
+                for x in 0..active_shape.x {
+                    let block_pos = IVec3::new(
+                        ((x as f32 - 1.0) * scale.x) as i32 + chunk_origin.x,
+                        world_y,
+                        world_z,
+                    );
 
-            let block_pos = IVec3 {
-                x: ((chunk_block[0] as f32 - 1.0) * scale[0]) as i32
-                    + (self.position.x * CHUNK_SIZE_I),
-                y: ((chunk_block[1] as f32 - 1.0) * scale[1]) as i32
-                    + (self.position.y * CHUNK_SIZE_I),
-                z: ((chunk_block[2] as f32 - 1.0) * scale[2]) as i32
-                    + (self.position.z * CHUNK_SIZE_I),
-            };
-
-            if let Some(voxel) = modified_voxels.get(&block_pos) {
-                voxels[idx] = *voxel;
-                if let WorldVoxel::Solid(m) = *voxel {
-                    filled_count += 1;
-                    if let Some(first) = first_material {
-                        has_multiple_materials |= first != m;
-                    } else {
-                        first_material = Some(m);
+                    if has_modified_voxels {
+                        if let Some(voxel) = modified_voxels.get(&block_pos) {
+                            voxels[idx] = *voxel;
+                            if let WorldVoxel::Solid(m) = *voxel {
+                                filled_count += 1;
+                                if let Some(first) = first_material {
+                                    has_multiple_materials |= first != m;
+                                } else {
+                                    first_material = Some(m);
+                                }
+                            }
+                            idx += 1;
+                            continue;
+                        }
                     }
-                }
-                continue;
-            }
 
-            let previous_voxel = previous_data_ref
-                .and_then(|chunk| chunk.get_voxel_at_world_position(block_pos));
+                    let previous_voxel = if has_previous_data {
+                        previous_data_ref.and_then(|chunk| {
+                            chunk.get_voxel_at_world_position(block_pos)
+                        })
+                    } else {
+                        None
+                    };
 
-            if reuse_previous {
-                if let Some(prev_voxel) = previous_voxel {
-                    if !prev_voxel.is_unset() {
-                        voxels[idx] = prev_voxel;
-                        if let WorldVoxel::Solid(m) = prev_voxel {
-                            filled_count += 1;
-                            if let Some(first) = first_material {
-                                has_multiple_materials |= first != m;
-                            } else {
-                                first_material = Some(m);
+                    if reuse_previous {
+                        if let Some(prev_voxel) = previous_voxel {
+                            if !prev_voxel.is_unset() {
+                                voxels[idx] = prev_voxel;
+                                if let WorldVoxel::Solid(m) = prev_voxel {
+                                    filled_count += 1;
+                                    if let Some(first) = first_material {
+                                        has_multiple_materials |= first != m;
+                                    } else {
+                                        first_material = Some(m);
+                                    }
+                                }
+                                idx += 1;
+                                continue;
                             }
                         }
-                        continue;
                     }
-                }
-            }
 
-            let voxel = voxel_data_fn(block_pos, previous_voxel);
+                    let voxel = voxel_data_fn(block_pos, previous_voxel);
 
-            voxels[idx] = voxel;
+                    voxels[idx] = voxel;
 
-            if let WorldVoxel::Solid(m) = voxel {
-                filled_count += 1;
-                if let Some(first) = first_material {
-                    has_multiple_materials |= first != m;
-                } else {
-                    first_material = Some(m);
+                    if let WorldVoxel::Solid(m) = voxel {
+                        filled_count += 1;
+                        if let Some(first) = first_material {
+                            has_multiple_materials |= first != m;
+                        } else {
+                            first_material = Some(m);
+                        }
+                    }
+
+                    idx += 1;
                 }
             }
         }
