@@ -3,7 +3,6 @@ use bevy::{
     image::{CompressedImageFormats, ImageSampler, ImageType},
     pbr::ExtendedMaterial,
     prelude::*,
-    time::common_conditions::on_timer,
 };
 
 use crate::{
@@ -114,8 +113,6 @@ where
     M: Material,
 {
     fn build(&self, app: &mut App) {
-        let chunk_lod_interval = self.config.chunk_lod_update_interval();
-        let retire_chunks_interval = self.config.retire_chunks_interval();
         app.init_resource::<C>()
             .add_systems(PreStartup, Internals::<C>::setup)
             .add_systems(
@@ -124,10 +121,8 @@ where
                     Internals::<C>::reset_diagnostics,
                     (
                         (
-                            Internals::<C>::retire_chunks
-                                .run_if(on_timer(retire_chunks_interval)),
-                            Internals::<C>::update_chunk_lods
-                                .run_if(on_timer(chunk_lod_interval)),
+                            Internals::<C>::retire_chunks,
+                            Internals::<C>::update_chunk_lods,
                             Internals::<C>::spawn_chunks,
                         )
                             .chain(),

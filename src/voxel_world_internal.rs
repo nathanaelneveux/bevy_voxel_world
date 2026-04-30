@@ -16,7 +16,7 @@ use std::{
     collections::VecDeque,
     marker::PhantomData,
     sync::{Arc, RwLock, TryLockError},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -78,6 +78,33 @@ pub struct VoxelWriteBuffer<C, I>(#[deref] Vec<(IVec3, WorldVoxel<I>)>, PhantomD
 pub(crate) struct NeedsMaterial<C>(PhantomData<C>);
 
 pub(crate) struct Internals<C>(PhantomData<C>);
+
+#[derive(Default)]
+pub(crate) struct DynamicIntervalGate {
+    interval: Duration,
+    timer: Option<Timer>,
+}
+
+impl DynamicIntervalGate {
+    fn should_run(&mut self, interval: Duration, delta: Duration) -> bool {
+        if interval.is_zero() {
+            self.timer = None;
+            self.interval = interval;
+            return true;
+        }
+
+        let timer = match self.timer.as_mut() {
+            Some(timer) if self.interval == interval => timer,
+            _ => {
+                self.interval = interval;
+                self.timer = Some(Timer::new(interval, TimerMode::Repeating));
+                self.timer.as_mut().expect("timer was just initialized")
+            }
+        };
+
+        timer.tick(delta).just_finished()
+    }
+}
 
 #[derive(Component)]
 pub struct WorldRoot<C>(PhantomData<C>);
@@ -623,11 +650,18 @@ where
         mut chunks: Query<(Entity, &mut Chunk<C>), Without<NeedsDespawn>>,
         mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         configuration: Res<C>,
+        time: Res<Time>,
+        mut interval_gate: Local<DynamicIntervalGate>,
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
     ) {
         let diagnostics_enabled = configuration.diagnostics_enabled();
         let diagnostics_start = diagnostics_enabled.then(Instant::now);
+        if !interval_gate
+            .should_run(configuration.chunk_lod_update_interval(), time.delta())
+        {
+            return;
+        }
         let mut scanned = 0;
         let mut changed = 0;
         let mut high_priority = 0;
@@ -704,11 +738,17 @@ where
         all_chunks: Query<&Chunk<C>, Without<NeedsDespawn>>,
         mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         configuration: Res<C>,
+        time: Res<Time>,
+        mut interval_gate: Local<DynamicIntervalGate>,
         camera_info: CameraInfo<C>,
         mut ev_chunk_will_despawn: MessageWriter<ChunkWillDespawn<C>>,
     ) {
         let diagnostics_enabled = configuration.diagnostics_enabled();
         let diagnostics_start = diagnostics_enabled.then(Instant::now);
+        if !interval_gate.should_run(configuration.retire_chunks_interval(), time.delta())
+        {
+            return;
+        }
         if configuration.max_chunk_despawns_per_frame() == 0 {
             return;
         }
