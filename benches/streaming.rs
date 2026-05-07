@@ -551,6 +551,7 @@ fn issue_voxel_writes(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_stats(
     world: Res<BenchWorld>,
     diagnostics: Res<VoxelWorldDiagnostics<BenchWorld>>,

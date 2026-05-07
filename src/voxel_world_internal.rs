@@ -267,6 +267,7 @@ where
     }
 
     /// Find and spawn chunks in need of spawning
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_chunks(
         mut commands: Commands,
         mut chunk_map_insert_buffer: ResMut<ChunkMapInsertBuffer<C, C::MaterialIndex>>,
@@ -434,7 +435,7 @@ where
                         &chunk_pos,
                         &chunk_map_read_lock,
                     ) {
-                        promote_low_priority(&chunk);
+                        promote_low_priority(chunk);
                         if chunk.is_full {
                             // If we hit a full chunk, we can stop the ray early
                             break;
@@ -591,12 +592,16 @@ where
             }
 
             // If we get here, we queue the neighbors
-            for x in -1..=1 {
+            'neighbors: for x in -1..=1 {
                 for y in -1..=1 {
                     for z in -1..=1 {
                         let queue_pos = chunk_position + IVec3::new(x, y, z);
                         if queue_pos == chunk_position {
                             continue;
+                        }
+                        if chunks_deque.len() >= candidate_queue_limit {
+                            diagnostics_frame.spawn_candidate_queue_limit_hit = true;
+                            break 'neighbors;
                         }
                         chunks_deque.push_back(SpawnCandidate {
                             position: queue_pos,
@@ -645,6 +650,7 @@ where
     }
 
     /// Update chunk LOD assignments and schedule remeshing when a change occurs.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_chunk_lods(
         mut commands: Commands,
         mut chunks: Query<(Entity, &mut Chunk<C>), Without<NeedsDespawn>>,
@@ -733,6 +739,7 @@ where
     }
 
     /// Tags chunks that are eligible for despawning
+    #[allow(clippy::too_many_arguments)]
     pub fn retire_chunks(
         mut commands: Commands,
         all_chunks: Query<&Chunk<C>, Without<NeedsDespawn>>,
@@ -917,7 +924,8 @@ where
         let diagnostics_start = diagnostics_enabled.then(Instant::now);
         let thread_pool = AsyncComputeTaskPool::get();
         let max_threads = configuration.max_active_chunk_threads();
-        let mut active_threads = chunk_threads.iter().len();
+        let active_threads = chunk_threads.iter().len();
+        let available_threads = max_threads.saturating_sub(active_threads);
         let mut started = 0;
 
         if diagnostics_enabled {
@@ -940,14 +948,8 @@ where
         let texture_index_mapper = configuration.texture_index_mapper();
         let mesh_map = mesh_cache.get_mesh_map();
 
-        for chunk in dirty_chunks.iter().chain(dirty_chunks_low.iter()) {
-            if active_threads >= max_threads {
-                if diagnostics_enabled {
-                    diagnostics.frame.remesh_cap_hit = true;
-                }
-                break;
-            }
-
+        let mut chunks_to_remesh = dirty_chunks.iter().chain(dirty_chunks_low.iter());
+        for chunk in chunks_to_remesh.by_ref().take(available_threads) {
             let previous_chunk_data = ChunkMap::<C, C::MaterialIndex>::get(
                 &chunk.position,
                 &chunk_map_read_lock,
@@ -1030,7 +1032,6 @@ where
                 .remove::<NeedsRemesh>()
                 .remove::<NeedsRemeshLowPriority>();
 
-            active_threads += 1;
             started += 1;
 
             ev_chunk_will_remesh
@@ -1038,6 +1039,7 @@ where
         }
 
         if diagnostics_enabled {
+            diagnostics.frame.remesh_cap_hit = chunks_to_remesh.next().is_some();
             diagnostics.frame.remesh_started = started;
             if let Some(start) = diagnostics_start {
                 diagnostics.frame.remesh_dirty_chunks_us = elapsed_micros(start);
