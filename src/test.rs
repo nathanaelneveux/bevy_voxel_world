@@ -1,6 +1,12 @@
 use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::*;
-use std::sync::Arc;
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use crate::chunk_map::ChunkMapUpdateBuffer;
 use crate::configuration::VoxelWorldConfig;
@@ -9,7 +15,7 @@ use crate::meshing::generate_chunk_mesh_for_shape;
 use crate::prelude::*;
 use crate::voxel_traversal::voxel_line_traversal;
 use crate::{
-    chunk::{ChunkData, ChunkTask, FillType, CHUNK_SIZE_F, PADDED_CHUNK_SIZE},
+    chunk::{Chunk, ChunkData, ChunkTask, FillType, CHUNK_SIZE_F, PADDED_CHUNK_SIZE},
     prelude::VoxelWorldCamera,
     voxel_world::*,
     voxel_world_internal::ModifiedVoxels,
@@ -25,6 +31,64 @@ fn _test_setup_app() -> App {
             Camera3d::default(),
             Transform::from_xyz(10.0, 10.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
             VoxelWorldCamera::<DefaultWorld>::default(),
+        ));
+    });
+
+    app
+}
+
+#[derive(Resource, Clone, Default)]
+struct StaticLongViewWorld;
+
+impl VoxelWorldConfig for StaticLongViewWorld {
+    type MaterialIndex = u8;
+    type ChunkUserBundle = ();
+
+    fn spawning_distance(&self) -> u32 {
+        32
+    }
+
+    fn min_despawn_distance(&self) -> u32 {
+        4
+    }
+
+    fn spawning_rays(&self) -> usize {
+        2048
+    }
+
+    fn max_spawn_per_frame(&self) -> usize {
+        4096
+    }
+
+    fn max_active_chunk_threads(&self) -> usize {
+        0
+    }
+
+    fn retire_chunks_interval(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn attach_chunks_to_root(&self) -> bool {
+        false
+    }
+}
+
+fn _static_long_view_app() -> App {
+    let mut app = App::new();
+    app.add_plugins((
+        MinimalPlugins,
+        VoxelWorldPlugin::<StaticLongViewWorld>::minimal(),
+    ));
+    app.add_systems(Startup, |mut commands: Commands| {
+        commands.spawn((
+            Camera3d::default(),
+            Projection::Perspective(PerspectiveProjection {
+                far: 4096.0,
+                aspect_ratio: 16.0 / 9.0,
+                ..default()
+            }),
+            Transform::from_xyz(10.0, 10.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+            VoxelWorldCamera::<StaticLongViewWorld>::default(),
         ));
     });
 
@@ -160,6 +224,7 @@ fn chunk_will_remesh_event_after_set_voxel() {
 #[test]
 fn chunk_will_despawn_event() {
     let mut app = _test_setup_app();
+    let observed = Arc::new(AtomicBool::new(false));
 
     // move camera to simulate chunks going out of view
     app.add_systems(
@@ -176,36 +241,112 @@ fn chunk_will_despawn_event() {
 
     app.update();
 
+    let reader_observed = observed.clone();
     app.add_systems(
         Update,
-        |mut ev_chunk_will_despawn: MessageReader<ChunkWillDespawn<DefaultWorld>>| {
+        move |mut ev_chunk_will_despawn: MessageReader<
+            ChunkWillDespawn<DefaultWorld>,
+        >| {
             let count = ev_chunk_will_despawn.read().count();
-            assert!(count > 0)
+            if count > 0 {
+                reader_observed.store(true, Ordering::SeqCst);
+            }
         },
     );
 
-    app.update();
+    for _ in 0..200 {
+        app.update();
+        if observed.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+
+    panic!("expected ChunkWillDespawn within 200 frames");
+}
+
+#[test]
+fn static_long_view_camera_does_not_despawn_visible_chunks_after_warmup() {
+    let mut app = _static_long_view_app();
+
+    for _ in 0..100 {
+        app.update();
+    }
+
+    let active_after_warmup = app
+        .world_mut()
+        .query_filtered::<(), (With<Chunk<StaticLongViewWorld>>, Without<NeedsDespawn>)>()
+        .iter(app.world())
+        .count();
+    assert!(
+        active_after_warmup > 0,
+        "expected static long-view warmup to spawn chunks"
+    );
+
+    let despawn_events = Arc::new(AtomicUsize::new(0));
+    let reader_despawn_events = despawn_events.clone();
+    app.add_systems(
+        Update,
+        move |mut ev_chunk_will_despawn: MessageReader<
+            ChunkWillDespawn<StaticLongViewWorld>,
+        >| {
+            reader_despawn_events
+                .fetch_add(ev_chunk_will_despawn.read().count(), Ordering::SeqCst);
+        },
+    );
+
+    for _ in 0..30 {
+        app.update();
+    }
+
+    let retiring_chunks = app
+        .world_mut()
+        .query_filtered::<(), (With<Chunk<StaticLongViewWorld>>, With<NeedsDespawn>)>()
+        .iter(app.world())
+        .count();
+
+    assert_eq!(
+        despawn_events.load(Ordering::SeqCst),
+        0,
+        "static camera should not despawn chunks it just considered spawn-visible"
+    );
+    assert_eq!(
+        retiring_chunks, 0,
+        "static camera should not leave visible chunks marked for despawn"
+    );
 }
 
 #[test]
 fn chunk_will_update_event() {
     let mut app = _test_setup_app();
+    let observed = Arc::new(AtomicBool::new(false));
+
+    for _ in 0..100 {
+        app.update();
+    }
 
     app.add_systems(Update, |mut voxel_world: VoxelWorld<DefaultWorld>| {
         voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(1));
     });
 
-    app.update();
-
+    let reader_observed = observed.clone();
     app.add_systems(
         Update,
-        |mut ev_chunk_will_update: MessageReader<ChunkWillUpdate<DefaultWorld>>| {
+        move |mut ev_chunk_will_update: MessageReader<ChunkWillUpdate<DefaultWorld>>| {
             let count = ev_chunk_will_update.read().count();
-            assert!(count > 0)
+            if count > 0 {
+                reader_observed.store(true, Ordering::SeqCst);
+            }
         },
     );
 
-    app.update();
+    for _ in 0..200 {
+        app.update();
+        if observed.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+
+    panic!("expected ChunkWillUpdate within 200 frames");
 }
 
 #[test]
@@ -718,31 +859,36 @@ fn set_voxel_same_value_does_not_trigger_remesh() {
 fn set_voxel_different_value_triggers_remesh() {
     let mut app = _test_setup_app();
 
-    // Set initial voxel
-    app.add_systems(Update, |mut voxel_world: VoxelWorld<DefaultWorld>| {
-        voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(1));
-    });
-    app.update();
-    app.update();
-
-    // Now change to a different value — should produce a ChunkWillUpdate event
-    app.add_systems(Update, |mut voxel_world: VoxelWorld<DefaultWorld>| {
-        voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(2));
-    });
-
-    app.update(); // writes Solid(2) to buffer
-    app.update(); // flushes — value differs, should trigger update
-
     app.add_systems(
         Update,
-        |mut ev_chunk_will_update: MessageReader<ChunkWillUpdate<DefaultWorld>>| {
-            let count = ev_chunk_will_update.read().count();
-            assert!(
-                count > 0,
-                "expected ChunkWillUpdate when setting voxel to different value"
-            );
+        |mut voxel_world: VoxelWorld<DefaultWorld>, mut phase: Local<u32>| {
+            if *phase == 0 && voxel_world.get_chunk_data(IVec3::ZERO).is_some() {
+                voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(1));
+                *phase = 1;
+            } else if *phase == 1 {
+                voxel_world.set_voxel(IVec3::new(0, 0, 0), WorldVoxel::Solid(2));
+                *phase = 2;
+            }
         },
     );
 
-    app.update();
+    let saw_update = Arc::new(AtomicBool::new(false));
+    let saw_update_system = saw_update.clone();
+    app.add_systems(
+        Last,
+        move |mut ev_chunk_will_update: MessageReader<ChunkWillUpdate<DefaultWorld>>| {
+            if ev_chunk_will_update.read().next().is_some() {
+                saw_update_system.store(true, Ordering::Relaxed);
+            }
+        },
+    );
+
+    for _ in 0..200 {
+        app.update();
+    }
+
+    assert!(
+        saw_update.load(Ordering::Relaxed),
+        "expected ChunkWillUpdate when setting voxel to different value"
+    );
 }

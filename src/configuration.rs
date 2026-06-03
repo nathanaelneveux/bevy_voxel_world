@@ -1,5 +1,4 @@
-use std::hash::Hash;
-use std::sync::Arc;
+use std::{hash::Hash, sync::Arc, time::Duration};
 
 use crate::chunk::{ChunkData, VoxelArray, PADDED_CHUNK_SIZE};
 use crate::meshing::generate_chunk_mesh_for_shape;
@@ -63,7 +62,7 @@ pub enum ChunkRegenerateStrategy {
     Repopulate,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
 pub enum ChunkDespawnStrategy {
     /// Despawn chunks that are further than `spawning_distance` away from the camera
     /// or outside of the viewport.
@@ -74,7 +73,7 @@ pub enum ChunkDespawnStrategy {
     FarAway,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
 pub enum ChunkSpawnStrategy {
     /// Spawn chunks that are within `spawning_distance` of the camera
     /// and also inside the viewport.
@@ -99,20 +98,11 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     /// If you are not using this feature, you can set this to `()`.
     type ChunkUserBundle: Bundle + Clone;
 
-    /// Maximum distance in chunks to spawn chunks, depending on the [`ChunkSpawnStrategy`]
+    /// Maximum distance in chunks to spawn chunks, depending on the [`ChunkSpawnStrategy`].
+    /// Note that this distance is also effectively clamped by the camera's far plane; make sure
+    /// the render camera can actually see out past this radius.
     fn spawning_distance(&self) -> u32 {
         10
-    }
-
-    /// Minimum distance in chunks to despawn chunks regardless of the [`ChunkSpawnStrategy`].
-    /// As a result, this radius will always remain spawned around the camera.
-    fn min_despawn_distance(&self) -> u32 {
-        1
-    }
-
-    /// Strategy for despawning chunks
-    fn chunk_despawn_strategy(&self) -> ChunkDespawnStrategy {
-        ChunkDespawnStrategy::default()
     }
 
     /// Strategy for spawning chunks
@@ -128,6 +118,11 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
         10000
     }
 
+    /// Maximum number of chunk generation tasks that may be active simultaneously.
+    fn max_active_chunk_threads(&self) -> usize {
+        usize::MAX
+    }
+
     /// Number of rays to cast when spawning chunks. Higher values will result in more
     /// chunks being spawned per frame, but will also increase cpu load, and can lead to
     /// thread contention.
@@ -139,6 +134,33 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     /// will reduce the likelyhood of chunks popping in, but will also increase cpu load.
     fn spawning_ray_margin(&self) -> u32 {
         25
+    }
+
+    /// Minimum distance in chunks to despawn chunks regardless of the [`ChunkSpawnStrategy`].
+    /// As a result, this radius will always remain spawned around the camera.
+    fn min_despawn_distance(&self) -> u32 {
+        1
+    }
+
+    /// Strategy for despawning chunks
+    fn chunk_despawn_strategy(&self) -> ChunkDespawnStrategy {
+        ChunkDespawnStrategy::default()
+    }
+
+    /// How often chunks should be considered for retirement.
+    ///
+    /// Lower values cull out-of-range chunks more aggressively but spend more CPU time.
+    fn retire_chunks_interval(&self) -> Duration {
+        //#TODO make this a better generic
+        Duration::from_millis(47)
+    }
+
+    /// Maximum number of chunks that can be despawned in a single frame.
+    ///
+    /// Set this to `0` to pause retire/despawn work temporarily. The default allows
+    /// unlimited chunk retirements per frame.
+    fn max_chunk_despawns_per_frame(&self) -> usize {
+        usize::MAX
     }
 
     /// Debugging aids
@@ -221,9 +243,12 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
         ChunkRegenerateStrategy::default()
     }
 
-    /// Maximum number of chunk generation tasks that may be active simultaneously.
-    fn max_active_chunk_threads(&self) -> usize {
-        usize::MAX
+    /// How often chunk LOD assignments should be re-evaluated.
+    ///
+    /// Shorter intervals keep LODs more responsive at the expense of iterating every chunk.
+    fn chunk_lod_update_interval(&self) -> Duration {
+        //#TODO make this a better generic
+        Duration::from_millis(53)
     }
 
     /// Whether chunk entities should be parented to the world root entity.
@@ -234,6 +259,13 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
     /// streaming into and out of view will perform better without a world_root.
     fn attach_chunks_to_root(&self) -> bool {
         true
+    }
+
+    /// Enables lightweight internal diagnostics counters for benchmarking and profiling.
+    ///
+    /// This is disabled by default to avoid adding timing/counter overhead to normal worlds.
+    fn diagnostics_enabled(&self) -> bool {
+        false
     }
 
     fn init_root(&self, mut _commands: Commands, _root: Entity) {}
@@ -283,6 +315,14 @@ impl DefaultWorld {}
 impl VoxelWorldConfig for DefaultWorld {
     type MaterialIndex = u8;
     type ChunkUserBundle = ();
+
+    fn chunk_lod_update_interval(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn retire_chunks_interval(&self) -> Duration {
+        Duration::ZERO
+    }
 
     fn texture_index_mapper(
         &self,
