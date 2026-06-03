@@ -40,7 +40,7 @@ impl VoxelWorldConfig for MainWorld {
     type ChunkUserBundle = ();
 
     fn spawning_distance(&self) -> u32 {
-        200
+        250
     }
 
     fn min_despawn_distance(&self) -> u32 {
@@ -133,6 +133,9 @@ impl VoxelWorldConfig for MainWorld {
         _previous_lod: Option<LodLevel>,
         camera_position: Vec3,
     ) -> LodLevel {
+        if chunk_position.y < -1 || chunk_position.y > 4 {
+            return 32;
+        }
         let camera_chunk = (camera_position / CHUNK_SIZE_F).floor();
         let distance = chunk_position.as_vec3().distance(camera_chunk);
 
@@ -174,6 +177,10 @@ fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
             order: 0,
             ..default()
         },
+        Projection::Perspective(PerspectiveProjection {
+            far: 999999.0,
+            ..default()
+        }),
         Transform::from_xyz(-200.0, 180.0, -200.0)
             .looking_at(Vec3::new(0.0, 60.0, 0.0), Vec3::Y),
         // This tells bevy_voxel_world to use this cameras transform to calculate spawning area
@@ -181,8 +188,8 @@ fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         DistanceFog {
             color: *ClearColor::default(),
             falloff: FogFalloff::Linear {
-                start: 125.0 * CHUNK_SIZE_F,
-                end: 200.0 * CHUNK_SIZE_F,
+                start: 175.0 * CHUNK_SIZE_F,
+                end: 250.0 * CHUNK_SIZE_F,
             },
             ..default()
         },

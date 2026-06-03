@@ -1,9 +1,9 @@
 use std::{
     marker::PhantomData,
-    sync::{Arc, RwLock, Weak},
+    sync::{Arc, RwLock, RwLockReadGuard, Weak},
 };
 
-use bevy::{platform::collections::HashMap, prelude::*};
+use bevy::{log::info_span, platform::collections::HashMap, prelude::*};
 use weak_table::WeakValueHashMap;
 
 use crate::prelude::VoxelWorldConfig;
@@ -13,12 +13,12 @@ use crate::prelude::VoxelWorldConfig;
 #[derive(Component)]
 pub(crate) struct MeshRef(pub Arc<Handle<Mesh>>);
 
-type WeakMeshMap = WeakValueHashMap<u64, Weak<Handle<Mesh>>>;
+pub(crate) type WeakMeshMap = WeakValueHashMap<u64, Weak<Handle<Mesh>>>;
 
 // TODO: Refactor this out of MeshCache. This is a bit of an afterthough, since user bundles are added via
 // the meshing delegate function, which only runs if there's no chached mesh for the chunk. Hence the need
 // to cache the user bundle here as well.
-type UserBundleMap<UB> = HashMap<u64, UB>;
+pub(crate) type UserBundleMap<UB> = HashMap<u64, UB>;
 
 /// MeshCache uses a weak map to keep track of mesh handles generated for a certain configuration of voxels.
 /// Using this map, we can avoid generating the same mesh multiple times, and reusing mesh handles
@@ -39,27 +39,29 @@ impl<C: VoxelWorldConfig> MeshCache<C> {
         if let (Ok(mut mesh_handles), Ok(mut user_bundles)) =
             (self.mesh_handles.try_write(), self.user_bundes.try_write())
         {
-            for (voxels, mesh, user_bundle) in insert_buffer.drain(..) {
-                mesh_handles.insert(voxels, mesh);
-                if let Some(user_bundle) = user_bundle {
-                    user_bundles.insert(voxels, user_bundle);
+            info_span!("mesh_cache_apply_insert").in_scope(|| {
+                for (voxels, mesh, user_bundle) in insert_buffer.drain(..) {
+                    mesh_handles.insert(voxels, mesh);
+                    if let Some(user_bundle) = user_bundle {
+                        user_bundles.insert(voxels, user_bundle);
+                    }
                 }
-            }
-            mesh_handles.remove_expired();
+            });
+            info_span!("mesh_cache_prune").in_scope(|| mesh_handles.remove_expired());
             //user_bundles.remove_expired();
         }
     }
 
-    pub fn get_mesh_handle(&self, voxels_hash: &u64) -> Option<Arc<Handle<Mesh>>> {
-        self.mesh_handles.read().unwrap().get(voxels_hash)
+    pub fn mesh_handles(&self) -> RwLockReadGuard<'_, WeakMeshMap> {
+        self.mesh_handles.read().unwrap()
     }
 
     pub fn get_mesh_map(&self) -> Arc<RwLock<WeakMeshMap>> {
         self.mesh_handles.clone()
     }
 
-    pub fn get_user_bundle(&self, voxels_hash: &u64) -> Option<C::ChunkUserBundle> {
-        self.user_bundes.read().unwrap().get(voxels_hash).cloned()
+    pub fn user_bundles(&self) -> RwLockReadGuard<'_, UserBundleMap<C::ChunkUserBundle>> {
+        self.user_bundes.read().unwrap()
     }
 }
 

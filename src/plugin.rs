@@ -28,6 +28,7 @@ where
     M: Material,
 {
     spawn_meshes: bool,
+    assign_materials: bool,
     use_custom_material: bool,
     config: C,
     material: M,
@@ -41,6 +42,18 @@ where
         Self {
             config,
             spawn_meshes: true,
+            assign_materials: true,
+            use_custom_material: false,
+            material: StandardMaterial::default(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn headless_with_config(config: C) -> Self {
+        Self {
+            config,
+            spawn_meshes: true,
+            assign_materials: false,
             use_custom_material: false,
             material: StandardMaterial::default(),
         }
@@ -49,6 +62,7 @@ where
     pub fn minimal() -> Self {
         Self {
             spawn_meshes: false,
+            assign_materials: false,
             use_custom_material: false,
             config: C::default(),
             material: StandardMaterial::default(),
@@ -73,6 +87,7 @@ where
     ) -> VoxelWorldPlugin<C, CustomMaterial> {
         VoxelWorldPlugin {
             spawn_meshes: self.spawn_meshes,
+            assign_materials: self.assign_materials,
             use_custom_material: true,
             config: self.config,
             material,
@@ -84,6 +99,7 @@ impl Default for VoxelWorldPlugin<DefaultWorld, StandardMaterial> {
     fn default() -> Self {
         Self {
             spawn_meshes: true,
+            assign_materials: true,
             use_custom_material: false,
             config: DefaultWorld,
             material: StandardMaterial::default(),
@@ -102,11 +118,12 @@ where
             .add_systems(
                 PreUpdate,
                 (
+                    Internals::<C>::reset_diagnostics,
                     (
                         (
-                            Internals::<C>::spawn_chunks,
-                            Internals::<C>::update_chunk_lods,
                             Internals::<C>::retire_chunks,
+                            Internals::<C>::update_chunk_lods,
+                            Internals::<C>::spawn_chunks,
                         )
                             .chain(),
                         Internals::<C>::remesh_dirty_chunks,
@@ -121,7 +138,8 @@ where
                         ),
                     )
                         .chain(),
-                ),
+                )
+                    .chain(),
             )
             .add_message::<ChunkWillSpawn<C>>()
             .add_message::<ChunkWillDespawn<C>>()
@@ -132,17 +150,26 @@ where
         // Spawning of meshes is optional, mainly to simplify testing.
         // This makes voxel_world work with a MinimalPlugins setup.
         if self.spawn_meshes {
+            app.add_systems(Update, Internals::<C>::spawn_meshes);
+        }
+
+        if self.spawn_meshes && !self.assign_materials {
+            app.insert_resource(LoadingTexture {
+                is_loaded: true,
+                handle: Handle::default(),
+            });
+        }
+
+        if self.spawn_meshes && self.assign_materials {
             load_internal_asset!(
                 app,
                 VOXEL_TEXTURE_SHADER_HANDLE,
                 "shaders/voxel_texture.wgsl",
                 Shader::from_wgsl
             );
-
-            app.add_systems(Update, Internals::<C>::spawn_meshes);
         }
 
-        if !self.use_custom_material && self.spawn_meshes {
+        if !self.use_custom_material && self.spawn_meshes && self.assign_materials {
             let mat_plugins =
                 app.get_added_plugins::<MaterialPlugin<
                     ExtendedMaterial<StandardMaterial, StandardVoxelMaterial>,
@@ -221,7 +248,7 @@ where
             );
         }
 
-        if self.use_custom_material {
+        if self.use_custom_material && self.assign_materials {
             if self.config.init_custom_materials() {
                 let mut custom_material_assets =
                     app.world_mut().resource_mut::<Assets<M>>();

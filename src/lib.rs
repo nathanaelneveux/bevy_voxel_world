@@ -23,6 +23,9 @@ pub mod prelude {
         ChunkWillChangeLod, ChunkWillDespawn, ChunkWillRemesh, ChunkWillSpawn,
         ChunkWillUpdate,
     };
+    pub use crate::voxel_world_internal::{
+        VoxelWorldDiagnostics, VoxelWorldDiagnosticsFrame,
+    };
 }
 
 pub mod custom_meshing {
@@ -49,6 +52,78 @@ pub mod rendering {
 
 pub mod traversal_alg {
     pub use crate::voxel_traversal::*;
+}
+
+#[doc(hidden)]
+pub mod benchmark {
+    use bevy::prelude::*;
+
+    use crate::{
+        chunk::{ChunkTask, CHUNK_SIZE_I},
+        configuration::{ChunkRegenerateStrategy, DefaultWorld, VoxelWorldConfig},
+        voxel::WorldVoxel,
+        voxel_world_internal::ModifiedVoxels,
+    };
+
+    #[derive(Clone, Copy)]
+    pub enum GenerationPattern {
+        Empty,
+        Full,
+        SingleVoxel,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct GenerationBenchResult {
+        pub is_empty: bool,
+        pub is_full: bool,
+        pub voxels_len: usize,
+        pub voxels_hash: u64,
+    }
+
+    pub fn generate_chunk_for_bench(
+        data_shape: UVec3,
+        pattern: GenerationPattern,
+    ) -> GenerationBenchResult {
+        type Mat = <DefaultWorld as VoxelWorldConfig>::MaterialIndex;
+
+        let modified_voxels = ModifiedVoxels::<DefaultWorld, Mat>::default();
+        let mut chunk_task = ChunkTask::<DefaultWorld, Mat>::new(
+            Entity::PLACEHOLDER,
+            IVec3::ZERO,
+            0,
+            data_shape,
+            data_shape,
+            modified_voxels,
+        );
+
+        chunk_task.generate(
+            move |world_pos, _previous| match pattern {
+                GenerationPattern::Empty => WorldVoxel::Air,
+                GenerationPattern::Full => WorldVoxel::Solid(1),
+                GenerationPattern::SingleVoxel => {
+                    if world_pos == IVec3::splat(CHUNK_SIZE_I / 2) {
+                        WorldVoxel::Solid(1)
+                    } else {
+                        WorldVoxel::Air
+                    }
+                }
+            },
+            None,
+            ChunkRegenerateStrategy::Repopulate,
+        );
+
+        GenerationBenchResult {
+            is_empty: chunk_task.is_empty(),
+            is_full: chunk_task.is_full(),
+            voxels_len: chunk_task
+                .chunk_data
+                .voxels
+                .as_ref()
+                .map(|voxels| voxels.len())
+                .unwrap_or_default(),
+            voxels_hash: chunk_task.voxels_hash(),
+        }
+    }
 }
 
 #[cfg(test)]
