@@ -121,6 +121,7 @@ where
                     Internals::<C>::reset_diagnostics,
                     (
                         (
+                            Internals::<C>::refresh_camera_snapshot,
                             Internals::<C>::retire_chunks,
                             Internals::<C>::update_chunk_lods,
                             Internals::<C>::spawn_chunks,

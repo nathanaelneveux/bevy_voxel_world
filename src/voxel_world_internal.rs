@@ -248,6 +248,7 @@ where
         commands.init_resource::<ModifiedVoxels<C, C::MaterialIndex>>();
         commands.init_resource::<VoxelWriteBuffer<C, C::MaterialIndex>>();
         commands.init_resource::<VoxelWorldDiagnostics<C>>();
+        commands.init_resource::<TrackedCameras<C>>();
 
         // Create the root node and allow to modify it by the configuration.
         let world_root = commands
@@ -268,6 +269,13 @@ where
         diagnostics.frame = VoxelWorldDiagnosticsFrame::default();
     }
 
+    pub fn refresh_camera_snapshot(
+        mut cameras: ResMut<TrackedCameras<C>>,
+        camera_info: CameraInfo<C>,
+    ) {
+        cameras.refresh(&camera_info);
+    }
+
     /// Find and spawn chunks in need of spawning
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_chunks(
@@ -278,7 +286,7 @@ where
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
         chunk_low_priority: Query<(), With<NeedsRemeshLowPriority>>,
         configuration: Res<C>,
-        camera_info: CameraInfo<C>,
+        cameras: Res<TrackedCameras<C>>,
         mut scratch: Local<SpawnChunkScratch>,
     ) {
         let diagnostics_enabled = configuration.diagnostics_enabled();
@@ -287,7 +295,6 @@ where
         let world_root = world_root.single().unwrap();
         let attach_to_root = configuration.attach_chunks_to_root();
 
-        let cameras = TrackedCameras::new(&camera_info);
         if cameras.is_empty() {
             return;
         }
@@ -389,7 +396,7 @@ where
              point: Vec2,
              queue: &mut VecDeque<SpawnCandidate>,
              ray_step_budget: &mut usize| {
-                let Ok(ray) = camera.camera.viewport_to_world(camera.transform, point)
+                let Ok(ray) = camera.camera.viewport_to_world(&camera.transform, point)
                 else {
                     return;
                 };
@@ -666,7 +673,7 @@ where
         configuration: Res<C>,
         time: Res<Time>,
         mut interval_gate: Local<DynamicIntervalGate>,
-        camera_info: CameraInfo<C>,
+        cameras: Res<TrackedCameras<C>>,
         mut ev_chunk_will_change_lod: MessageWriter<ChunkWillChangeLod<C>>,
     ) {
         let diagnostics_enabled = configuration.diagnostics_enabled();
@@ -681,7 +688,6 @@ where
         let mut high_priority = 0;
         let mut low_priority = 0;
         let mut threads_canceled = 0;
-        let cameras = TrackedCameraPositions::new(&camera_info);
         if cameras.is_empty() {
             return;
         }
@@ -755,7 +761,7 @@ where
         configuration: Res<C>,
         time: Res<Time>,
         mut interval_gate: Local<DynamicIntervalGate>,
-        camera_info: CameraInfo<C>,
+        cameras: Res<TrackedCameras<C>>,
         mut ev_chunk_will_despawn: MessageWriter<ChunkWillDespawn<C>>,
     ) {
         let diagnostics_enabled = configuration.diagnostics_enabled();
@@ -768,7 +774,6 @@ where
             return;
         }
 
-        let cameras = TrackedCameras::new(&camera_info);
         if cameras.is_empty() {
             return;
         }
@@ -1290,26 +1295,26 @@ where
     }
 }
 
-struct TrackedCamera<'a> {
-    camera: &'a Camera,
-    transform: &'a GlobalTransform,
-    visibility: ChunkVisibilityVolume<'a>,
+struct TrackedCamera {
+    camera: Camera,
+    transform: GlobalTransform,
+    visibility: ChunkVisibilityVolume,
     viewport_size: UVec2,
     position: Vec3,
     chunk_position: IVec3,
 }
 
-impl<'a> TrackedCamera<'a> {
+impl TrackedCamera {
     fn new(
-        camera: &'a Camera,
-        transform: &'a GlobalTransform,
-        projection: &'a Projection,
-        frustum: &'a Frustum,
+        camera: &Camera,
+        transform: &GlobalTransform,
+        projection: &Projection,
+        frustum: &Frustum,
     ) -> Self {
         let position = transform.translation();
         Self {
-            camera,
-            transform,
+            camera: camera.clone(),
+            transform: *transform,
             visibility: ChunkVisibilityVolume::new(transform, projection, frustum),
             viewport_size: camera.physical_viewport_size().unwrap_or_default(),
             position,
@@ -1324,22 +1329,35 @@ impl<'a> TrackedCamera<'a> {
     }
 }
 
-struct TrackedCameras<'a> {
-    cameras: SmallVec<[TrackedCamera<'a>; 2]>,
+#[derive(Resource)]
+pub(crate) struct TrackedCameras<C: VoxelWorldConfig> {
+    cameras: SmallVec<[TrackedCamera; 2]>,
+    _marker: PhantomData<C>,
 }
 
-impl<'a> TrackedCameras<'a> {
+impl<C: VoxelWorldConfig> Default for TrackedCameras<C> {
+    fn default() -> Self {
+        Self {
+            cameras: SmallVec::new(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<C: VoxelWorldConfig> TrackedCameras<C> {
     #[inline]
-    fn new<C: VoxelWorldConfig>(camera_info: &'a CameraInfo<C>) -> Self {
-        let mut cameras = SmallVec::<[TrackedCamera<'a>; 2]>::new();
+    fn refresh(&mut self, camera_info: &CameraInfo<C>) {
+        self.cameras.clear();
         for (camera, transform, projection, frustum) in camera_info.iter() {
             let tracked = TrackedCamera::new(camera, transform, projection, frustum);
-            if !cameras.iter().any(|camera| camera.has_same_view(&tracked)) {
-                cameras.push(tracked);
+            if !self
+                .cameras
+                .iter()
+                .any(|camera| camera.has_same_view(&tracked))
+            {
+                self.cameras.push(tracked);
             }
         }
-
-        Self { cameras }
     }
 
     #[inline]
@@ -1348,7 +1366,7 @@ impl<'a> TrackedCameras<'a> {
     }
 
     #[inline]
-    fn camera_for_ray(&self, ray_index: usize) -> Option<&TrackedCamera<'a>> {
+    fn camera_for_ray(&self, ray_index: usize) -> Option<&TrackedCamera> {
         match self.cameras.len() {
             0 => None,
             1 => Some(&self.cameras[0]),
@@ -1414,73 +1432,6 @@ impl<'a> TrackedCameras<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct TrackedCameraPosition {
-    position: Vec3,
-    chunk_position: IVec3,
-}
-
-impl TrackedCameraPosition {
-    #[inline]
-    fn new(transform: &GlobalTransform) -> Self {
-        let position = transform.translation();
-        Self {
-            position,
-            chunk_position: position.as_ivec3() / CHUNK_SIZE_I,
-        }
-    }
-}
-
-struct TrackedCameraPositions {
-    cameras: SmallVec<[TrackedCameraPosition; 2]>,
-}
-
-impl TrackedCameraPositions {
-    #[inline]
-    fn new<C: VoxelWorldConfig>(camera_info: &CameraInfo<C>) -> Self {
-        let mut cameras = SmallVec::<[TrackedCameraPosition; 2]>::new();
-        for (_, transform, _, _) in camera_info.iter() {
-            let tracked = TrackedCameraPosition::new(transform);
-            if !cameras
-                .iter()
-                .any(|camera| camera.position == tracked.position)
-            {
-                cameras.push(tracked);
-            }
-        }
-
-        Self { cameras }
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.cameras.is_empty()
-    }
-
-    #[inline]
-    fn is_chunk_close(&self, chunk_position: IVec3, distance_squared: i32) -> bool {
-        match self.cameras.len() {
-            0 => false,
-            1 => {
-                chunk_position.distance_squared(self.cameras[0].chunk_position)
-                    <= distance_squared
-            }
-            _ => self.cameras.iter().any(|camera| {
-                chunk_position.distance_squared(camera.chunk_position) <= distance_squared
-            }),
-        }
-    }
-
-    #[inline]
-    fn closest_position_to_chunk(&self, chunk_position: IVec3) -> Vec3 {
-        match self.cameras.len() {
-            0 => Vec3::ZERO,
-            1 => self.cameras[0].position,
-            _ => closest_camera_position_to_chunk_position(&self.cameras, chunk_position),
-        }
-    }
-}
-
 fn chunk_is_close_to_any_camera(
     cameras: &[TrackedCamera],
     chunk_position: IVec3,
@@ -1493,22 +1444,6 @@ fn chunk_is_close_to_any_camera(
 
 fn closest_camera_position_to_chunk(
     cameras: &[TrackedCamera],
-    chunk_position: IVec3,
-) -> Vec3 {
-    let chunk_world_position = chunk_position.as_vec3() * CHUNK_SIZE_F;
-    cameras
-        .iter()
-        .min_by(|a, b| {
-            a.position
-                .distance_squared(chunk_world_position)
-                .total_cmp(&b.position.distance_squared(chunk_world_position))
-        })
-        .map(|camera| camera.position)
-        .unwrap_or(Vec3::ZERO)
-}
-
-fn closest_camera_position_to_chunk_position(
-    cameras: &[TrackedCameraPosition],
     chunk_position: IVec3,
 ) -> Vec3 {
     let chunk_world_position = chunk_position.as_vec3() * CHUNK_SIZE_F;
@@ -1605,7 +1540,7 @@ fn viewport_margin_to_ndc(viewport_size: UVec2, margin: u32) -> Vec2 {
     )
 }
 
-enum ChunkVisibilityVolume<'a> {
+enum ChunkVisibilityVolume {
     Perspective {
         origin: Vec3,
         forward: Vec3,
@@ -1616,14 +1551,14 @@ enum ChunkVisibilityVolume<'a> {
         near: f32,
         far: f32,
     },
-    Frustum(&'a Frustum),
+    Frustum(Frustum),
 }
 
-impl<'a> ChunkVisibilityVolume<'a> {
+impl ChunkVisibilityVolume {
     fn new(
         camera_transform: &GlobalTransform,
         projection: &Projection,
-        frustum: &'a Frustum,
+        frustum: &Frustum,
     ) -> Self {
         match projection {
             Projection::Perspective(projection) => {
@@ -1639,7 +1574,7 @@ impl<'a> ChunkVisibilityVolume<'a> {
                     far: projection.far,
                 }
             }
-            _ => Self::Frustum(frustum),
+            _ => Self::Frustum(*frustum),
         }
     }
 
@@ -1677,9 +1612,7 @@ impl<'a> ChunkVisibilityVolume<'a> {
                     && near == other_near
                     && far == other_far
             }
-            (Self::Frustum(frustum), Self::Frustum(other_frustum)) => {
-                std::ptr::eq(*frustum, *other_frustum)
-            }
+            (Self::Frustum(_), Self::Frustum(_)) => false,
             _ => false,
         }
     }
