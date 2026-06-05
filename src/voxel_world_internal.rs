@@ -12,6 +12,7 @@ use bevy::{
     tasks::AsyncComputeTaskPool,
 };
 use futures_lite::future;
+use rand::RngExt;
 use std::{
     collections::VecDeque,
     marker::PhantomData,
@@ -289,6 +290,7 @@ where
         if cameras.is_empty() {
             return;
         }
+        let single_camera = cameras.single();
 
         let spawning_distance = configuration.spawning_distance() as i32;
         let spawning_distance_squared = spawning_distance.pow(2);
@@ -478,32 +480,67 @@ where
 
         // Each frame we pick some random points on the screen
         let m = configuration.spawning_ray_margin();
+        let mut rng = rand::rng();
         let collect_candidates_start = diagnostics_enabled.then(Instant::now);
-        for _ in 0..configuration.spawning_rays() {
-            if chunks_deque.len() >= candidate_queue_limit || spawn_ray_step_budget == 0 {
-                diagnostics_frame.spawn_candidate_queue_limit_hit |=
-                    chunks_deque.len() >= candidate_queue_limit;
-                diagnostics_frame.spawn_ray_step_budget_hit |= spawn_ray_step_budget == 0;
-                break;
-            }
-            let camera = cameras.random_camera().expect("cameras is not empty");
+        if let Some(camera) = single_camera {
             let viewport_size =
                 camera.camera.physical_viewport_size().unwrap_or_default();
-            let random_point_in_viewport = {
-                let x =
-                    rand::random::<f32>() * (viewport_size.x + m * 2) as f32 - m as f32;
-                let y =
-                    rand::random::<f32>() * (viewport_size.y + m * 2) as f32 - m as f32;
-                Vec2::new(x, y)
-            };
+            for _ in 0..configuration.spawning_rays() {
+                if chunks_deque.len() >= candidate_queue_limit
+                    || spawn_ray_step_budget == 0
+                {
+                    diagnostics_frame.spawn_candidate_queue_limit_hit |=
+                        chunks_deque.len() >= candidate_queue_limit;
+                    diagnostics_frame.spawn_ray_step_budget_hit |=
+                        spawn_ray_step_budget == 0;
+                    break;
+                }
+                let random_point_in_viewport = {
+                    let x =
+                        rng.random::<f32>() * (viewport_size.x + m * 2) as f32 - m as f32;
+                    let y =
+                        rng.random::<f32>() * (viewport_size.y + m * 2) as f32 - m as f32;
+                    Vec2::new(x, y)
+                };
 
-            // Then, for each point, we cast a ray, picking up any unspawned chunks along the ray
-            queue_chunks_intersecting_ray_from_point(
-                camera,
-                random_point_in_viewport,
-                chunks_deque,
-                &mut spawn_ray_step_budget,
-            );
+                // Then, for each point, we cast a ray, picking up any unspawned chunks along the ray
+                queue_chunks_intersecting_ray_from_point(
+                    camera,
+                    random_point_in_viewport,
+                    chunks_deque,
+                    &mut spawn_ray_step_budget,
+                );
+            }
+        } else {
+            for _ in 0..configuration.spawning_rays() {
+                if chunks_deque.len() >= candidate_queue_limit
+                    || spawn_ray_step_budget == 0
+                {
+                    diagnostics_frame.spawn_candidate_queue_limit_hit |=
+                        chunks_deque.len() >= candidate_queue_limit;
+                    diagnostics_frame.spawn_ray_step_budget_hit |=
+                        spawn_ray_step_budget == 0;
+                    break;
+                }
+                let camera = cameras.random_camera().expect("cameras is not empty");
+                let viewport_size =
+                    camera.camera.physical_viewport_size().unwrap_or_default();
+                let random_point_in_viewport = {
+                    let x =
+                        rng.random::<f32>() * (viewport_size.x + m * 2) as f32 - m as f32;
+                    let y =
+                        rng.random::<f32>() * (viewport_size.y + m * 2) as f32 - m as f32;
+                    Vec2::new(x, y)
+                };
+
+                // Then, for each point, we cast a ray, picking up any unspawned chunks along the ray
+                queue_chunks_intersecting_ray_from_point(
+                    camera,
+                    random_point_in_viewport,
+                    chunks_deque,
+                    &mut spawn_ray_step_budget,
+                );
+            }
         }
         if let Some(start) = collect_candidates_start {
             diagnostics_frame.spawn_collect_candidates_us = elapsed_micros(start);
@@ -511,7 +548,7 @@ where
 
         // We also queue the chunks closest to every camera to make sure they will always spawn early.
         let process_queue_start = diagnostics_enabled.then(Instant::now);
-        cameras.for_each(|camera| {
+        if let Some(camera) = single_camera {
             for offset in protected_offsets.iter() {
                 chunks_deque.push_front(SpawnCandidate {
                     position: camera.chunk_position + *offset,
@@ -519,7 +556,17 @@ where
                     protected_chunk: true,
                 });
             }
-        });
+        } else {
+            cameras.for_each(|camera| {
+                for offset in protected_offsets.iter() {
+                    chunks_deque.push_front(SpawnCandidate {
+                        position: camera.chunk_position + *offset,
+                        known_missing_chunk: false,
+                        protected_chunk: true,
+                    });
+                }
+            });
+        }
 
         // Then, when we have a queue of chunks, we can set them up for spawning
         let mut spawned_this_frame = 0;
@@ -535,8 +582,13 @@ where
             diagnostics_frame.spawn_unique_candidates += 1;
 
             if !candidate.protected_chunk {
-                let close_to_camera =
-                    cameras.is_chunk_close(chunk_position, spawning_distance_squared);
+                let close_to_camera = single_camera.map_or_else(
+                    || cameras.is_chunk_close(chunk_position, spawning_distance_squared),
+                    |camera| {
+                        chunk_position.distance_squared(camera.chunk_position)
+                            <= spawning_distance_squared
+                    },
+                );
                 if !close_to_camera {
                     diagnostics_frame.spawn_distance_culled += 1;
                     continue;
@@ -547,7 +599,14 @@ where
                 && spawn_strategy == ChunkSpawnStrategy::CloseAndInView
             {
                 diagnostics_frame.spawn_frustum_checks += 1;
-                let visible = cameras.is_chunk_visible(chunk_position, visibility_margin);
+                let visible = single_camera.map_or_else(
+                    || cameras.is_chunk_visible(chunk_position, visibility_margin),
+                    |camera| {
+                        camera
+                            .visibility
+                            .contains_chunk(chunk_position, visibility_margin)
+                    },
+                );
                 if !visible {
                     diagnostics_frame.spawn_frustum_culled += 1;
                     continue;
@@ -568,7 +627,10 @@ where
                 if attach_to_root {
                     commands.entity(world_root).add_child(chunk_entity);
                 }
-                let camera_position = cameras.closest_position_to_chunk(chunk_position);
+                let camera_position = single_camera.map_or_else(
+                    || cameras.closest_position_to_chunk(chunk_position),
+                    |camera| camera.position,
+                );
                 let lod_level =
                     configuration.chunk_lod(chunk_position, None, camera_position);
                 let data_shape = configuration.chunk_data_shape(lod_level);
@@ -682,7 +744,7 @@ where
         let mut high_priority = 0;
         let mut low_priority = 0;
         let mut threads_canceled = 0;
-        let cameras = TrackedCameras::new(&camera_info);
+        let cameras = TrackedCameraPositions::new(&camera_info);
         if cameras.is_empty() {
             return;
         }
@@ -690,7 +752,7 @@ where
         let min_despawn_distance_sq =
             (configuration.min_despawn_distance() as i32).pow(2);
 
-        if let TrackedCameras::One(camera) = &cameras {
+        if let TrackedCameraPositions::One(camera) = &cameras {
             let camera_position = camera.position;
             let camera_chunk = camera.chunk_position;
 
@@ -1449,6 +1511,7 @@ enum TrackedCameras<'a> {
 }
 
 impl<'a> TrackedCameras<'a> {
+    #[inline]
     fn new<C: VoxelWorldConfig>(camera_info: &'a CameraInfo<C>) -> Self {
         let mut cameras =
             camera_info
@@ -1470,10 +1533,20 @@ impl<'a> TrackedCameras<'a> {
         Self::Many(all)
     }
 
+    #[inline]
     fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
     }
 
+    #[inline]
+    fn single(&self) -> Option<&TrackedCamera<'a>> {
+        match self {
+            Self::One(camera) => Some(camera),
+            _ => None,
+        }
+    }
+
+    #[inline]
     fn random_camera(&self) -> Option<&TrackedCamera<'a>> {
         match self {
             Self::Empty => None,
@@ -1482,6 +1555,7 @@ impl<'a> TrackedCameras<'a> {
         }
     }
 
+    #[inline]
     fn for_each(&self, mut f: impl FnMut(&TrackedCamera<'a>)) {
         match self {
             Self::Empty => {}
@@ -1494,6 +1568,7 @@ impl<'a> TrackedCameras<'a> {
         }
     }
 
+    #[inline]
     fn viewport_margin_to_ndc(&self, margin: u32) -> Vec2 {
         match self {
             Self::Empty => Vec2::ZERO,
@@ -1505,6 +1580,7 @@ impl<'a> TrackedCameras<'a> {
         }
     }
 
+    #[inline]
     fn is_chunk_close(&self, chunk_position: IVec3, distance_squared: i32) -> bool {
         match self {
             Self::Empty => false,
@@ -1517,6 +1593,7 @@ impl<'a> TrackedCameras<'a> {
         }
     }
 
+    #[inline]
     fn closest_position_to_chunk(&self, chunk_position: IVec3) -> Vec3 {
         match self {
             Self::Empty => Vec3::ZERO,
@@ -1527,6 +1604,7 @@ impl<'a> TrackedCameras<'a> {
         }
     }
 
+    #[inline]
     fn is_chunk_visible(&self, chunk_position: IVec3, ndc_margin: Vec2) -> bool {
         match self {
             Self::Empty => false,
@@ -1535,6 +1613,88 @@ impl<'a> TrackedCameras<'a> {
             }
             Self::Many(cameras) => {
                 chunk_visible_to_any_camera(cameras, chunk_position, ndc_margin)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TrackedCameraPosition {
+    position: Vec3,
+    chunk_position: IVec3,
+}
+
+impl TrackedCameraPosition {
+    #[inline]
+    fn new(transform: &GlobalTransform) -> Self {
+        let position = transform.translation();
+        Self {
+            position,
+            chunk_position: position.as_ivec3() / CHUNK_SIZE_I,
+        }
+    }
+}
+
+enum TrackedCameraPositions {
+    Empty,
+    One(TrackedCameraPosition),
+    Many(Vec<TrackedCameraPosition>),
+}
+
+impl TrackedCameraPositions {
+    #[inline]
+    fn new<C: VoxelWorldConfig>(camera_info: &CameraInfo<C>) -> Self {
+        let mut cameras = camera_info
+            .iter()
+            .map(|(_, transform, _, _)| TrackedCameraPosition::new(transform));
+        let Some(first) = cameras.next() else {
+            return Self::Empty;
+        };
+        let Some(second) = cameras.next() else {
+            return Self::One(first);
+        };
+
+        let mut all = Vec::with_capacity(cameras.size_hint().0.saturating_add(2));
+        all.push(first);
+        all.push(second);
+        all.extend(cameras);
+        Self::Many(all)
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[inline]
+    fn is_chunk_close(&self, chunk_position: IVec3, distance_squared: i32) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(camera) => {
+                chunk_position.distance_squared(camera.chunk_position) <= distance_squared
+            }
+            Self::Many(cameras) => cameras.iter().any(|camera| {
+                chunk_position.distance_squared(camera.chunk_position) <= distance_squared
+            }),
+        }
+    }
+
+    #[inline]
+    fn closest_position_to_chunk(&self, chunk_position: IVec3) -> Vec3 {
+        match self {
+            Self::Empty => Vec3::ZERO,
+            Self::One(camera) => camera.position,
+            Self::Many(cameras) => {
+                let chunk_world_position = chunk_position.as_vec3() * CHUNK_SIZE_F;
+                cameras
+                    .iter()
+                    .min_by(|a, b| {
+                        a.position
+                            .distance_squared(chunk_world_position)
+                            .total_cmp(&b.position.distance_squared(chunk_world_position))
+                    })
+                    .map(|camera| camera.position)
+                    .unwrap_or(Vec3::ZERO)
             }
         }
     }
