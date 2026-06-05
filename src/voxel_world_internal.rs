@@ -13,6 +13,7 @@ use bevy::{
 };
 use futures_lite::future;
 use rand::RngExt;
+use smallvec::SmallVec;
 use std::{
     collections::VecDeque,
     marker::PhantomData,
@@ -290,7 +291,6 @@ where
         if cameras.is_empty() {
             return;
         }
-        let single_camera = cameras.single();
 
         let spawning_distance = configuration.spawning_distance() as i32;
         let spawning_distance_squared = spawning_distance.pow(2);
@@ -482,65 +482,30 @@ where
         let m = configuration.spawning_ray_margin();
         let mut rng = rand::rng();
         let collect_candidates_start = diagnostics_enabled.then(Instant::now);
-        if let Some(camera) = single_camera {
-            let viewport_size =
-                camera.camera.physical_viewport_size().unwrap_or_default();
-            for _ in 0..configuration.spawning_rays() {
-                if chunks_deque.len() >= candidate_queue_limit
-                    || spawn_ray_step_budget == 0
-                {
-                    diagnostics_frame.spawn_candidate_queue_limit_hit |=
-                        chunks_deque.len() >= candidate_queue_limit;
-                    diagnostics_frame.spawn_ray_step_budget_hit |=
-                        spawn_ray_step_budget == 0;
-                    break;
-                }
-                let random_point_in_viewport = {
-                    let x =
-                        rng.random::<f32>() * (viewport_size.x + m * 2) as f32 - m as f32;
-                    let y =
-                        rng.random::<f32>() * (viewport_size.y + m * 2) as f32 - m as f32;
-                    Vec2::new(x, y)
-                };
-
-                // Then, for each point, we cast a ray, picking up any unspawned chunks along the ray
-                queue_chunks_intersecting_ray_from_point(
-                    camera,
-                    random_point_in_viewport,
-                    chunks_deque,
-                    &mut spawn_ray_step_budget,
-                );
+        for ray_index in 0..configuration.spawning_rays() {
+            if chunks_deque.len() >= candidate_queue_limit || spawn_ray_step_budget == 0 {
+                diagnostics_frame.spawn_candidate_queue_limit_hit |=
+                    chunks_deque.len() >= candidate_queue_limit;
+                diagnostics_frame.spawn_ray_step_budget_hit |= spawn_ray_step_budget == 0;
+                break;
             }
-        } else {
-            for _ in 0..configuration.spawning_rays() {
-                if chunks_deque.len() >= candidate_queue_limit
-                    || spawn_ray_step_budget == 0
-                {
-                    diagnostics_frame.spawn_candidate_queue_limit_hit |=
-                        chunks_deque.len() >= candidate_queue_limit;
-                    diagnostics_frame.spawn_ray_step_budget_hit |=
-                        spawn_ray_step_budget == 0;
-                    break;
-                }
-                let camera = cameras.random_camera().expect("cameras is not empty");
-                let viewport_size =
-                    camera.camera.physical_viewport_size().unwrap_or_default();
-                let random_point_in_viewport = {
-                    let x =
-                        rng.random::<f32>() * (viewport_size.x + m * 2) as f32 - m as f32;
-                    let y =
-                        rng.random::<f32>() * (viewport_size.y + m * 2) as f32 - m as f32;
-                    Vec2::new(x, y)
-                };
+            let camera = cameras
+                .camera_for_ray(ray_index)
+                .expect("cameras is not empty");
+            let viewport_size = camera.viewport_size;
+            let random_point_in_viewport = {
+                let x = rng.random::<f32>() * (viewport_size.x + m * 2) as f32 - m as f32;
+                let y = rng.random::<f32>() * (viewport_size.y + m * 2) as f32 - m as f32;
+                Vec2::new(x, y)
+            };
 
-                // Then, for each point, we cast a ray, picking up any unspawned chunks along the ray
-                queue_chunks_intersecting_ray_from_point(
-                    camera,
-                    random_point_in_viewport,
-                    chunks_deque,
-                    &mut spawn_ray_step_budget,
-                );
-            }
+            // Then, for each point, we cast a ray, picking up any unspawned chunks along the ray
+            queue_chunks_intersecting_ray_from_point(
+                camera,
+                random_point_in_viewport,
+                chunks_deque,
+                &mut spawn_ray_step_budget,
+            );
         }
         if let Some(start) = collect_candidates_start {
             diagnostics_frame.spawn_collect_candidates_us = elapsed_micros(start);
@@ -548,25 +513,15 @@ where
 
         // We also queue the chunks closest to every camera to make sure they will always spawn early.
         let process_queue_start = diagnostics_enabled.then(Instant::now);
-        if let Some(camera) = single_camera {
+        cameras.for_each_unique_chunk_position(|camera_chunk_position| {
             for offset in protected_offsets.iter() {
                 chunks_deque.push_front(SpawnCandidate {
-                    position: camera.chunk_position + *offset,
+                    position: camera_chunk_position + *offset,
                     known_missing_chunk: false,
                     protected_chunk: true,
                 });
             }
-        } else {
-            cameras.for_each(|camera| {
-                for offset in protected_offsets.iter() {
-                    chunks_deque.push_front(SpawnCandidate {
-                        position: camera.chunk_position + *offset,
-                        known_missing_chunk: false,
-                        protected_chunk: true,
-                    });
-                }
-            });
-        }
+        });
 
         // Then, when we have a queue of chunks, we can set them up for spawning
         let mut spawned_this_frame = 0;
@@ -581,33 +536,18 @@ where
             }
             diagnostics_frame.spawn_unique_candidates += 1;
 
-            if !candidate.protected_chunk {
-                let close_to_camera = single_camera.map_or_else(
-                    || cameras.is_chunk_close(chunk_position, spawning_distance_squared),
-                    |camera| {
-                        chunk_position.distance_squared(camera.chunk_position)
-                            <= spawning_distance_squared
-                    },
-                );
-                if !close_to_camera {
-                    diagnostics_frame.spawn_distance_culled += 1;
-                    continue;
-                }
+            if !candidate.protected_chunk
+                && !cameras.is_chunk_close(chunk_position, spawning_distance_squared)
+            {
+                diagnostics_frame.spawn_distance_culled += 1;
+                continue;
             }
 
             if !candidate.protected_chunk
                 && spawn_strategy == ChunkSpawnStrategy::CloseAndInView
             {
                 diagnostics_frame.spawn_frustum_checks += 1;
-                let visible = single_camera.map_or_else(
-                    || cameras.is_chunk_visible(chunk_position, visibility_margin),
-                    |camera| {
-                        camera
-                            .visibility
-                            .contains_chunk(chunk_position, visibility_margin)
-                    },
-                );
-                if !visible {
+                if !cameras.is_chunk_visible(chunk_position, visibility_margin) {
                     diagnostics_frame.spawn_frustum_culled += 1;
                     continue;
                 }
@@ -627,10 +567,7 @@ where
                 if attach_to_root {
                     commands.entity(world_root).add_child(chunk_entity);
                 }
-                let camera_position = single_camera.map_or_else(
-                    || cameras.closest_position_to_chunk(chunk_position),
-                    |camera| camera.position,
-                );
+                let camera_position = cameras.closest_position_to_chunk(chunk_position);
                 let lod_level =
                     configuration.chunk_lod(chunk_position, None, camera_position);
                 let data_shape = configuration.chunk_data_shape(lod_level);
@@ -752,99 +689,49 @@ where
         let min_despawn_distance_sq =
             (configuration.min_despawn_distance() as i32).pow(2);
 
-        if let TrackedCameraPositions::One(camera) = &cameras {
-            let camera_position = camera.position;
-            let camera_chunk = camera.chunk_position;
-
-            for (entity, mut chunk) in chunks.iter_mut() {
-                scanned += 1;
-                let target_lod = configuration.chunk_lod(
-                    chunk.position,
-                    Some(chunk.lod_level),
-                    camera_position,
-                );
-                if target_lod == chunk.lod_level {
-                    continue;
-                }
-                changed += 1;
-
-                ev_chunk_will_change_lod
-                    .write(ChunkWillChangeLod::<C>::new(chunk.position, entity));
-
-                let data_shape = configuration.chunk_data_shape(target_lod);
-                let mesh_shape = configuration.chunk_meshing_shape(target_lod);
-
-                if chunk.data_shape == data_shape && chunk.mesh_shape == mesh_shape {
-                    chunk.lod_level = target_lod;
-                    // Shape did not change, so nothing to regenerate/remesh.
-                    continue;
-                }
-
-                chunk.data_shape = data_shape;
-                chunk.mesh_shape = mesh_shape;
-                chunk.lod_level = target_lod;
-
-                let mut entity_commands = commands.entity(entity);
-                let chunk_distance_sq = chunk.position.distance_squared(camera_chunk);
-                if chunk_distance_sq <= min_despawn_distance_sq {
-                    high_priority += 1;
-                    entity_commands
-                        .try_insert(NeedsRemesh)
-                        .remove::<NeedsRemeshLowPriority>();
-                } else {
-                    low_priority += 1;
-                    entity_commands
-                        .try_insert(NeedsRemeshLowPriority)
-                        .remove::<NeedsRemesh>();
-                }
-                threads_canceled += 1;
-                entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
+        for (entity, mut chunk) in chunks.iter_mut() {
+            scanned += 1;
+            let camera_position = cameras.closest_position_to_chunk(chunk.position);
+            let target_lod = configuration.chunk_lod(
+                chunk.position,
+                Some(chunk.lod_level),
+                camera_position,
+            );
+            if target_lod == chunk.lod_level {
+                continue;
             }
-        } else {
-            for (entity, mut chunk) in chunks.iter_mut() {
-                scanned += 1;
-                let camera_position = cameras.closest_position_to_chunk(chunk.position);
-                let target_lod = configuration.chunk_lod(
-                    chunk.position,
-                    Some(chunk.lod_level),
-                    camera_position,
-                );
-                if target_lod == chunk.lod_level {
-                    continue;
-                }
-                changed += 1;
+            changed += 1;
 
-                ev_chunk_will_change_lod
-                    .write(ChunkWillChangeLod::<C>::new(chunk.position, entity));
+            ev_chunk_will_change_lod
+                .write(ChunkWillChangeLod::<C>::new(chunk.position, entity));
 
-                let data_shape = configuration.chunk_data_shape(target_lod);
-                let mesh_shape = configuration.chunk_meshing_shape(target_lod);
+            let data_shape = configuration.chunk_data_shape(target_lod);
+            let mesh_shape = configuration.chunk_meshing_shape(target_lod);
 
-                if chunk.data_shape == data_shape && chunk.mesh_shape == mesh_shape {
-                    chunk.lod_level = target_lod;
-                    // Shape did not change, so nothing to regenerate/remesh.
-                    continue;
-                }
-
-                chunk.data_shape = data_shape;
-                chunk.mesh_shape = mesh_shape;
+            if chunk.data_shape == data_shape && chunk.mesh_shape == mesh_shape {
                 chunk.lod_level = target_lod;
-
-                let mut entity_commands = commands.entity(entity);
-                if cameras.is_chunk_close(chunk.position, min_despawn_distance_sq) {
-                    high_priority += 1;
-                    entity_commands
-                        .try_insert(NeedsRemesh)
-                        .remove::<NeedsRemeshLowPriority>();
-                } else {
-                    low_priority += 1;
-                    entity_commands
-                        .try_insert(NeedsRemeshLowPriority)
-                        .remove::<NeedsRemesh>();
-                }
-                threads_canceled += 1;
-                entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
+                // Shape did not change, so nothing to regenerate/remesh.
+                continue;
             }
+
+            chunk.data_shape = data_shape;
+            chunk.mesh_shape = mesh_shape;
+            chunk.lod_level = target_lod;
+
+            let mut entity_commands = commands.entity(entity);
+            if cameras.is_chunk_close(chunk.position, min_despawn_distance_sq) {
+                high_priority += 1;
+                entity_commands
+                    .try_insert(NeedsRemesh)
+                    .remove::<NeedsRemeshLowPriority>();
+            } else {
+                low_priority += 1;
+                entity_commands
+                    .try_insert(NeedsRemeshLowPriority)
+                    .remove::<NeedsRemesh>();
+            }
+            threads_canceled += 1;
+            entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
         }
 
         if diagnostics_enabled {
@@ -896,90 +783,48 @@ where
         let mut frustum_culled_count = 0;
         let mut distance_culled_count = 0;
 
-        if let TrackedCameras::One(camera) = &cameras {
-            let visibility_margin = viewport_margin_to_ndc(
-                camera.camera.physical_viewport_size().unwrap_or_default(),
-                configuration.spawning_ray_margin(),
-            );
+        let visibility_margin =
+            cameras.viewport_margin_to_ndc(configuration.spawning_ray_margin());
 
-            match strategy {
-                ChunkDespawnStrategy::FarAway => {
-                    for chunk in all_chunks.iter() {
-                        scanned += 1;
-                        let dist_squared =
-                            chunk.position.distance_squared(camera.chunk_position);
-                        let distance_culled =
-                            dist_squared > spawning_distance_squared + 1;
-                        if !distance_culled {
-                            continue;
-                        }
+        match strategy {
+            ChunkDespawnStrategy::FarAway => {
+                for chunk in all_chunks.iter() {
+                    scanned += 1;
+                    if cameras
+                        .is_chunk_close(chunk.position, spawning_distance_squared + 1)
+                    {
+                        continue;
+                    }
 
-                        marked += 1;
-                        distance_culled_count += 1;
-                        commands
-                            .entity(chunk.entity)
-                            .try_insert(NeedsDespawn)
-                            .remove::<NeedsRemesh>()
-                            .remove::<NeedsRemeshLowPriority>();
-                        ev_chunk_will_despawn.write(ChunkWillDespawn::<C>::new(
-                            chunk.position,
-                            chunk.entity,
-                        ));
-                    }
-                }
-                ChunkDespawnStrategy::FarAwayOrOutOfView => {
-                    for chunk in all_chunks.iter() {
-                        scanned += 1;
-                        let dist_squared =
-                            chunk.position.distance_squared(camera.chunk_position);
-                        if dist_squared <= near_distance_squared {
-                            continue;
-                        }
-                        let distance_culled =
-                            dist_squared > spawning_distance_squared + 1;
-                        if distance_culled
-                            || !camera
-                                .visibility
-                                .contains_chunk(chunk.position, visibility_margin)
-                        {
-                            marked += 1;
-                            if distance_culled {
-                                distance_culled_count += 1;
-                            } else {
-                                frustum_checks += 1;
-                                frustum_culled_count += 1;
-                            }
-                            commands
-                                .entity(chunk.entity)
-                                .try_insert(NeedsDespawn)
-                                .remove::<NeedsRemesh>()
-                                .remove::<NeedsRemeshLowPriority>();
-                            ev_chunk_will_despawn.write(ChunkWillDespawn::<C>::new(
-                                chunk.position,
-                                chunk.entity,
-                            ));
-                        } else {
-                            frustum_checks += 1;
-                        }
-                    }
+                    marked += 1;
+                    distance_culled_count += 1;
+                    commands
+                        .entity(chunk.entity)
+                        .try_insert(NeedsDespawn)
+                        .remove::<NeedsRemesh>()
+                        .remove::<NeedsRemeshLowPriority>();
+                    ev_chunk_will_despawn
+                        .write(ChunkWillDespawn::<C>::new(chunk.position, chunk.entity));
                 }
             }
-        } else {
-            let visibility_margin =
-                cameras.viewport_margin_to_ndc(configuration.spawning_ray_margin());
-
-            match strategy {
-                ChunkDespawnStrategy::FarAway => {
-                    for chunk in all_chunks.iter() {
-                        scanned += 1;
-                        if cameras
-                            .is_chunk_close(chunk.position, spawning_distance_squared + 1)
-                        {
-                            continue;
-                        }
-
+            ChunkDespawnStrategy::FarAwayOrOutOfView => {
+                for chunk in all_chunks.iter() {
+                    scanned += 1;
+                    if cameras.is_chunk_close(chunk.position, near_distance_squared) {
+                        continue;
+                    }
+                    let distance_culled = !cameras
+                        .is_chunk_close(chunk.position, spawning_distance_squared + 1);
+                    if distance_culled
+                        || !cameras.is_chunk_visible(chunk.position, visibility_margin)
+                    {
                         marked += 1;
-                        distance_culled_count += 1;
+                        if distance_culled {
+                            distance_culled_count += 1;
+                        } else {
+                            frustum_checks += 1;
+                            frustum_culled_count += 1;
+                        }
                         commands
                             .entity(chunk.entity)
                             .try_insert(NeedsDespawn)
@@ -989,41 +834,8 @@ where
                             chunk.position,
                             chunk.entity,
                         ));
-                    }
-                }
-                ChunkDespawnStrategy::FarAwayOrOutOfView => {
-                    for chunk in all_chunks.iter() {
-                        scanned += 1;
-                        if cameras.is_chunk_close(chunk.position, near_distance_squared) {
-                            continue;
-                        }
-                        let distance_culled = !cameras.is_chunk_close(
-                            chunk.position,
-                            spawning_distance_squared + 1,
-                        );
-                        if distance_culled
-                            || !cameras
-                                .is_chunk_visible(chunk.position, visibility_margin)
-                        {
-                            marked += 1;
-                            if distance_culled {
-                                distance_culled_count += 1;
-                            } else {
-                                frustum_checks += 1;
-                                frustum_culled_count += 1;
-                            }
-                            commands
-                                .entity(chunk.entity)
-                                .try_insert(NeedsDespawn)
-                                .remove::<NeedsRemesh>()
-                                .remove::<NeedsRemeshLowPriority>();
-                            ev_chunk_will_despawn.write(ChunkWillDespawn::<C>::new(
-                                chunk.position,
-                                chunk.entity,
-                            ));
-                        } else {
-                            frustum_checks += 1;
-                        }
+                    } else {
+                        frustum_checks += 1;
                     }
                 }
             }
@@ -1482,6 +1294,7 @@ struct TrackedCamera<'a> {
     camera: &'a Camera,
     transform: &'a GlobalTransform,
     visibility: ChunkVisibilityVolume<'a>,
+    viewport_size: UVec2,
     position: Vec3,
     chunk_position: IVec3,
 }
@@ -1498,122 +1311,105 @@ impl<'a> TrackedCamera<'a> {
             camera,
             transform,
             visibility: ChunkVisibilityVolume::new(transform, projection, frustum),
+            viewport_size: camera.physical_viewport_size().unwrap_or_default(),
             position,
             chunk_position: position.as_ivec3() / CHUNK_SIZE_I,
         }
     }
+
+    #[inline]
+    fn has_same_view(&self, other: &Self) -> bool {
+        self.viewport_size == other.viewport_size
+            && self.visibility.has_same_shape(&other.visibility)
+    }
 }
 
-enum TrackedCameras<'a> {
-    Empty,
-    One(TrackedCamera<'a>),
-    Many(Vec<TrackedCamera<'a>>),
+struct TrackedCameras<'a> {
+    cameras: SmallVec<[TrackedCamera<'a>; 2]>,
 }
 
 impl<'a> TrackedCameras<'a> {
     #[inline]
     fn new<C: VoxelWorldConfig>(camera_info: &'a CameraInfo<C>) -> Self {
-        let mut cameras =
-            camera_info
-                .iter()
-                .map(|(camera, transform, projection, frustum)| {
-                    TrackedCamera::new(camera, transform, projection, frustum)
-                });
-        let Some(first) = cameras.next() else {
-            return Self::Empty;
-        };
-        let Some(second) = cameras.next() else {
-            return Self::One(first);
-        };
+        let mut cameras = SmallVec::<[TrackedCamera<'a>; 2]>::new();
+        for (camera, transform, projection, frustum) in camera_info.iter() {
+            let tracked = TrackedCamera::new(camera, transform, projection, frustum);
+            if !cameras.iter().any(|camera| camera.has_same_view(&tracked)) {
+                cameras.push(tracked);
+            }
+        }
 
-        let mut all = Vec::with_capacity(cameras.size_hint().0.saturating_add(2));
-        all.push(first);
-        all.push(second);
-        all.extend(cameras);
-        Self::Many(all)
+        Self { cameras }
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty)
+        self.cameras.is_empty()
     }
 
     #[inline]
-    fn single(&self) -> Option<&TrackedCamera<'a>> {
-        match self {
-            Self::One(camera) => Some(camera),
-            _ => None,
+    fn camera_for_ray(&self, ray_index: usize) -> Option<&TrackedCamera<'a>> {
+        match self.cameras.len() {
+            0 => None,
+            1 => Some(&self.cameras[0]),
+            len => Some(&self.cameras[ray_index % len]),
         }
     }
 
     #[inline]
-    fn random_camera(&self) -> Option<&TrackedCamera<'a>> {
-        match self {
-            Self::Empty => None,
-            Self::One(camera) => Some(camera),
-            Self::Many(cameras) => Some(&cameras[rand::random_range(0..cameras.len())]),
-        }
-    }
-
-    #[inline]
-    fn for_each(&self, mut f: impl FnMut(&TrackedCamera<'a>)) {
-        match self {
-            Self::Empty => {}
-            Self::One(camera) => f(camera),
-            Self::Many(cameras) => {
-                for camera in cameras {
-                    f(camera);
-                }
+    fn for_each_unique_chunk_position(&self, mut f: impl FnMut(IVec3)) {
+        let mut seen = SmallVec::<[IVec3; 2]>::new();
+        for camera in &self.cameras {
+            if seen.contains(&camera.chunk_position) {
+                continue;
             }
+            seen.push(camera.chunk_position);
+            f(camera.chunk_position);
         }
     }
 
     #[inline]
     fn viewport_margin_to_ndc(&self, margin: u32) -> Vec2 {
-        match self {
-            Self::Empty => Vec2::ZERO,
-            Self::One(camera) => viewport_margin_to_ndc(
-                camera.camera.physical_viewport_size().unwrap_or_default(),
-                margin,
-            ),
-            Self::Many(cameras) => cameras_viewport_margin_to_ndc(cameras, margin),
+        match self.cameras.len() {
+            0 => Vec2::ZERO,
+            1 => viewport_margin_to_ndc(self.cameras[0].viewport_size, margin),
+            _ => cameras_viewport_margin_to_ndc(&self.cameras, margin),
         }
     }
 
     #[inline]
     fn is_chunk_close(&self, chunk_position: IVec3, distance_squared: i32) -> bool {
-        match self {
-            Self::Empty => false,
-            Self::One(camera) => {
-                chunk_position.distance_squared(camera.chunk_position) <= distance_squared
+        match self.cameras.len() {
+            0 => false,
+            1 => {
+                chunk_position.distance_squared(self.cameras[0].chunk_position)
+                    <= distance_squared
             }
-            Self::Many(cameras) => {
-                chunk_is_close_to_any_camera(cameras, chunk_position, distance_squared)
-            }
+            _ => chunk_is_close_to_any_camera(
+                &self.cameras,
+                chunk_position,
+                distance_squared,
+            ),
         }
     }
 
     #[inline]
     fn closest_position_to_chunk(&self, chunk_position: IVec3) -> Vec3 {
-        match self {
-            Self::Empty => Vec3::ZERO,
-            Self::One(camera) => camera.position,
-            Self::Many(cameras) => {
-                closest_camera_position_to_chunk(cameras, chunk_position)
-            }
+        match self.cameras.len() {
+            0 => Vec3::ZERO,
+            1 => self.cameras[0].position,
+            _ => closest_camera_position_to_chunk(&self.cameras, chunk_position),
         }
     }
 
     #[inline]
     fn is_chunk_visible(&self, chunk_position: IVec3, ndc_margin: Vec2) -> bool {
-        match self {
-            Self::Empty => false,
-            Self::One(camera) => {
-                camera.visibility.contains_chunk(chunk_position, ndc_margin)
-            }
-            Self::Many(cameras) => {
-                chunk_visible_to_any_camera(cameras, chunk_position, ndc_margin)
-            }
+        match self.cameras.len() {
+            0 => false,
+            1 => self.cameras[0]
+                .visibility
+                .contains_chunk(chunk_position, ndc_margin),
+            _ => chunk_visible_to_any_camera(&self.cameras, chunk_position, ndc_margin),
         }
     }
 }
@@ -1635,45 +1431,41 @@ impl TrackedCameraPosition {
     }
 }
 
-enum TrackedCameraPositions {
-    Empty,
-    One(TrackedCameraPosition),
-    Many(Vec<TrackedCameraPosition>),
+struct TrackedCameraPositions {
+    cameras: SmallVec<[TrackedCameraPosition; 2]>,
 }
 
 impl TrackedCameraPositions {
     #[inline]
     fn new<C: VoxelWorldConfig>(camera_info: &CameraInfo<C>) -> Self {
-        let mut cameras = camera_info
-            .iter()
-            .map(|(_, transform, _, _)| TrackedCameraPosition::new(transform));
-        let Some(first) = cameras.next() else {
-            return Self::Empty;
-        };
-        let Some(second) = cameras.next() else {
-            return Self::One(first);
-        };
+        let mut cameras = SmallVec::<[TrackedCameraPosition; 2]>::new();
+        for (_, transform, _, _) in camera_info.iter() {
+            let tracked = TrackedCameraPosition::new(transform);
+            if !cameras
+                .iter()
+                .any(|camera| camera.position == tracked.position)
+            {
+                cameras.push(tracked);
+            }
+        }
 
-        let mut all = Vec::with_capacity(cameras.size_hint().0.saturating_add(2));
-        all.push(first);
-        all.push(second);
-        all.extend(cameras);
-        Self::Many(all)
+        Self { cameras }
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty)
+        self.cameras.is_empty()
     }
 
     #[inline]
     fn is_chunk_close(&self, chunk_position: IVec3, distance_squared: i32) -> bool {
-        match self {
-            Self::Empty => false,
-            Self::One(camera) => {
-                chunk_position.distance_squared(camera.chunk_position) <= distance_squared
+        match self.cameras.len() {
+            0 => false,
+            1 => {
+                chunk_position.distance_squared(self.cameras[0].chunk_position)
+                    <= distance_squared
             }
-            Self::Many(cameras) => cameras.iter().any(|camera| {
+            _ => self.cameras.iter().any(|camera| {
                 chunk_position.distance_squared(camera.chunk_position) <= distance_squared
             }),
         }
@@ -1681,21 +1473,10 @@ impl TrackedCameraPositions {
 
     #[inline]
     fn closest_position_to_chunk(&self, chunk_position: IVec3) -> Vec3 {
-        match self {
-            Self::Empty => Vec3::ZERO,
-            Self::One(camera) => camera.position,
-            Self::Many(cameras) => {
-                let chunk_world_position = chunk_position.as_vec3() * CHUNK_SIZE_F;
-                cameras
-                    .iter()
-                    .min_by(|a, b| {
-                        a.position
-                            .distance_squared(chunk_world_position)
-                            .total_cmp(&b.position.distance_squared(chunk_world_position))
-                    })
-                    .map(|camera| camera.position)
-                    .unwrap_or(Vec3::ZERO)
-            }
+        match self.cameras.len() {
+            0 => Vec3::ZERO,
+            1 => self.cameras[0].position,
+            _ => closest_camera_position_to_chunk_position(&self.cameras, chunk_position),
         }
     }
 }
@@ -1726,12 +1507,25 @@ fn closest_camera_position_to_chunk(
         .unwrap_or(Vec3::ZERO)
 }
 
+fn closest_camera_position_to_chunk_position(
+    cameras: &[TrackedCameraPosition],
+    chunk_position: IVec3,
+) -> Vec3 {
+    let chunk_world_position = chunk_position.as_vec3() * CHUNK_SIZE_F;
+    cameras
+        .iter()
+        .min_by(|a, b| {
+            a.position
+                .distance_squared(chunk_world_position)
+                .total_cmp(&b.position.distance_squared(chunk_world_position))
+        })
+        .map(|camera| camera.position)
+        .unwrap_or(Vec3::ZERO)
+}
+
 fn cameras_viewport_margin_to_ndc(cameras: &[TrackedCamera], margin: u32) -> Vec2 {
     cameras.iter().fold(Vec2::ZERO, |max_margin, camera| {
-        max_margin.max(viewport_margin_to_ndc(
-            camera.camera.physical_viewport_size().unwrap_or_default(),
-            margin,
-        ))
+        max_margin.max(viewport_margin_to_ndc(camera.viewport_size, margin))
     })
 }
 
@@ -1846,6 +1640,47 @@ impl<'a> ChunkVisibilityVolume<'a> {
                 }
             }
             _ => Self::Frustum(frustum),
+        }
+    }
+
+    #[inline]
+    fn has_same_shape(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Perspective {
+                    origin,
+                    forward,
+                    right,
+                    up,
+                    tan_half_fov_y,
+                    tan_half_fov_x,
+                    near,
+                    far,
+                },
+                Self::Perspective {
+                    origin: other_origin,
+                    forward: other_forward,
+                    right: other_right,
+                    up: other_up,
+                    tan_half_fov_y: other_tan_half_fov_y,
+                    tan_half_fov_x: other_tan_half_fov_x,
+                    near: other_near,
+                    far: other_far,
+                },
+            ) => {
+                origin == other_origin
+                    && forward == other_forward
+                    && right == other_right
+                    && up == other_up
+                    && tan_half_fov_y == other_tan_half_fov_y
+                    && tan_half_fov_x == other_tan_half_fov_x
+                    && near == other_near
+                    && far == other_far
+            }
+            (Self::Frustum(frustum), Self::Frustum(other_frustum)) => {
+                std::ptr::eq(*frustum, *other_frustum)
+            }
+            _ => false,
         }
     }
 

@@ -29,6 +29,7 @@ struct BenchScenario {
     warmup_frames: u32,
     world: WorldShape,
     camera_path: CameraPath,
+    camera_count: usize,
     writes: WriteLoad,
     spawn_strategy: ChunkSpawnStrategy,
     despawn_strategy: ChunkDespawnStrategy,
@@ -412,7 +413,7 @@ fn build_app(scenario: BenchScenario) -> App {
     app.insert_resource(TimeUpdateStrategy::ManualDuration(FRAME_TIME));
     app.insert_resource(BenchControl::default());
     app.insert_resource(BenchStats::default());
-    app.add_systems(Startup, spawn_camera);
+    app.add_systems(Startup, spawn_cameras);
     app.add_systems(First, (drive_camera, issue_voxel_writes));
     app.add_systems(Last, collect_stats);
 
@@ -446,7 +447,7 @@ fn run_frames(app: &mut App, frames: u32) {
     }
 }
 
-fn spawn_camera(mut commands: Commands) {
+fn spawn_cameras(mut commands: Commands, world: Res<BenchWorld>) {
     let projection = PerspectiveProjection {
         aspect_ratio: BENCH_VIEWPORT_SIZE.x as f32 / BENCH_VIEWPORT_SIZE.y as f32,
         far: 999_999.0,
@@ -465,25 +466,23 @@ fn spawn_camera(mut commands: Commands) {
     });
     camera.computed.clip_from_view = projection.get_clip_from_view();
 
-    commands.spawn((
-        Camera3d::default(),
-        camera,
-        Projection::Perspective(projection),
-        Transform::from_xyz(0.0, 32.0, -64.0)
-            .looking_at(Vec3::new(0.0, 16.0, 256.0), Vec3::Y),
-        VoxelWorldCamera::<BenchWorld>::default(),
-    ));
+    for _ in 0..world.scenario.camera_count.max(1) {
+        commands.spawn((
+            Camera3d::default(),
+            camera.clone(),
+            Projection::Perspective(projection.clone()),
+            Transform::from_xyz(0.0, 32.0, -64.0)
+                .looking_at(Vec3::new(0.0, 16.0, 256.0), Vec3::Y),
+            VoxelWorldCamera::<BenchWorld>::default(),
+        ));
+    }
 }
 
 fn drive_camera(
     control: Res<BenchControl>,
     world: Res<BenchWorld>,
-    mut camera: Query<&mut Transform, With<VoxelWorldCamera<BenchWorld>>>,
+    mut cameras: Query<&mut Transform, With<VoxelWorldCamera<BenchWorld>>>,
 ) {
-    let Ok(mut transform) = camera.single_mut() else {
-        return;
-    };
-
     let frame = control.frame as f32;
     let (position, look_offset) = match world.scenario.camera_path {
         CameraPath::FastLinear => (
@@ -519,8 +518,11 @@ fn drive_camera(
         }
     };
 
-    *transform =
+    let transform =
         Transform::from_translation(position).looking_at(position + look_offset, Vec3::Y);
+    for mut camera in cameras.iter_mut() {
+        *camera = transform;
+    }
 }
 
 fn issue_voxel_writes(
@@ -1061,6 +1063,7 @@ fn base_fast_camera() -> BenchScenario {
         warmup_frames: 12,
         world: WorldShape::AsteroidField,
         camera_path: CameraPath::FastLinear,
+        camera_count: 1,
         writes: WriteLoad::None,
         spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
         despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1085,6 +1088,7 @@ fn distance_128_relaxed_lod() -> BenchScenario {
         warmup_frames: 24,
         world: WorldShape::AsteroidField,
         camera_path: CameraPath::HighDistanceCruise,
+        camera_count: 1,
         writes: WriteLoad::None,
         spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
         despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1109,6 +1113,7 @@ fn distance_128_single_voxel() -> BenchScenario {
         warmup_frames: 15,
         world: WorldShape::SingleVoxelPerChunk,
         camera_path: CameraPath::HighDistanceCruise,
+        camera_count: 1,
         writes: WriteLoad::None,
         spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
         despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1141,6 +1146,7 @@ fn mesh_cache_lifecycle(name: &'static str, world: WorldShape) -> BenchScenario 
         warmup_frames: 0,
         world,
         camera_path: CameraPath::Static,
+        camera_count: 1,
         writes: WriteLoad::None,
         spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
         despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1196,6 +1202,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 0,
             world: WorldShape::AsteroidField,
             camera_path: CameraPath::Static,
+            camera_count: 1,
             writes: WriteLoad::None,
             spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
             despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1217,6 +1224,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 120,
             world: WorldShape::SingleVoxelPerChunk,
             camera_path: CameraPath::Static,
+            camera_count: 1,
             writes: WriteLoad::None,
             spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
             despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1238,6 +1246,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 120,
             world: WorldShape::SingleVoxelPerChunk,
             camera_path: CameraPath::SlowInChunkDrift,
+            camera_count: 1,
             writes: WriteLoad::None,
             spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
             despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1267,6 +1276,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 24,
             world: WorldShape::Empty,
             camera_path: CameraPath::DespawnJump,
+            camera_count: 1,
             writes: WriteLoad::None,
             spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
             despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1288,6 +1298,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 8,
             world: WorldShape::DenseOccluding,
             camera_path: CameraPath::FastLinear,
+            camera_count: 1,
             writes: WriteLoad::None,
             spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
             despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1309,6 +1320,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 16,
             world: WorldShape::Empty,
             camera_path: CameraPath::Static,
+            camera_count: 1,
             writes: WriteLoad::SameValue {
                 writes_per_frame: 512,
             },
@@ -1332,6 +1344,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 16,
             world: WorldShape::FlatTerrain,
             camera_path: CameraPath::LodOscillation,
+            camera_count: 1,
             writes: WriteLoad::None,
             spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
             despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1353,6 +1366,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 24,
             world: WorldShape::AsteroidField,
             camera_path: CameraPath::DespawnJump,
+            camera_count: 1,
             writes: WriteLoad::None,
             spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
             despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1374,6 +1388,7 @@ fn scenarios() -> Vec<BenchScenario> {
             warmup_frames: 16,
             world: WorldShape::AsteroidField,
             camera_path: CameraPath::FastLinear,
+            camera_count: 1,
             writes: WriteLoad::MovingEdits {
                 writes_per_frame: 256,
             },
@@ -1404,6 +1419,7 @@ fn knob_scenarios() -> Vec<BenchScenario> {
         warmup_frames: 24,
         world: WorldShape::AsteroidField,
         camera_path: CameraPath::DespawnJump,
+        camera_count: 1,
         writes: WriteLoad::None,
         spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
         despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1425,6 +1441,7 @@ fn knob_scenarios() -> Vec<BenchScenario> {
         warmup_frames: 16,
         world: WorldShape::FlatTerrain,
         camera_path: CameraPath::LodOscillation,
+        camera_count: 1,
         writes: WriteLoad::None,
         spawn_strategy: ChunkSpawnStrategy::CloseAndInView,
         despawn_strategy: ChunkDespawnStrategy::FarAwayOrOutOfView,
@@ -1446,6 +1463,7 @@ fn knob_scenarios() -> Vec<BenchScenario> {
         warmup_frames: 16,
         world: WorldShape::AsteroidField,
         camera_path: CameraPath::FastLinear,
+        camera_count: 1,
         writes: WriteLoad::MovingEdits {
             writes_per_frame: 256,
         },
@@ -1465,6 +1483,24 @@ fn knob_scenarios() -> Vec<BenchScenario> {
     };
 
     vec![
+        BenchScenario {
+            name: "multicam_same_view_1",
+            camera_count: 1,
+            spawning_rays: 512,
+            ..d128
+        },
+        BenchScenario {
+            name: "multicam_same_view_2",
+            camera_count: 2,
+            spawning_rays: 512,
+            ..d128
+        },
+        BenchScenario {
+            name: "multicam_same_view_4",
+            camera_count: 4,
+            spawning_rays: 512,
+            ..d128
+        },
         BenchScenario {
             name: "ray_sweep_fast_4",
             spawning_rays: 4,
