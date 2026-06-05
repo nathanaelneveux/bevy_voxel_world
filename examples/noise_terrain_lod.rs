@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
-    light::CascadeShadowConfigBuilder,
+    light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     pbr::{DistanceFog, FogFalloff},
     platform::collections::HashMap,
     prelude::*,
@@ -197,8 +197,9 @@ fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
 
     // Sun
     let cascade_shadow_config = CascadeShadowConfigBuilder {
-        maximum_distance: 3000.0,
-        first_cascade_far_bound: 200.0,
+        num_cascades: 3,
+        maximum_distance: 3200.0,
+        first_cascade_far_bound: 320.0,
         ..default()
     }
     .build();
@@ -219,6 +220,7 @@ fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         brightness: 100.0,
         affects_lightmapped_meshes: true,
     });
+    commands.insert_resource(DirectionalLightShadowMap { size: 256 });
 
     // UI overlay camera
     commands.spawn((
