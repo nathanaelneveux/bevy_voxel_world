@@ -554,11 +554,7 @@ where
                 && spawn_strategy == ChunkSpawnStrategy::CloseAndInView
             {
                 diagnostics_frame.spawn_frustum_checks += 1;
-                if !cameras.is_chunk_visible_to_close_camera(
-                    chunk_position,
-                    spawning_distance_squared,
-                    visibility_margin,
-                ) {
+                if !cameras.is_chunk_visible(chunk_position, visibility_margin) {
                     diagnostics_frame.spawn_frustum_culled += 1;
                     continue;
                 }
@@ -788,7 +784,7 @@ where
         let strategy = configuration.chunk_despawn_strategy();
         let mut scanned = 0;
         let mut marked = 0;
-        let mut frustum_checks = 0;
+        let frustum_checks = 0;
         let mut frustum_culled_count = 0;
         let mut distance_culled_count = 0;
 
@@ -819,25 +815,14 @@ where
             ChunkDespawnStrategy::FarAwayOrOutOfView => {
                 for chunk in all_chunks.iter() {
                     scanned += 1;
-                    if cameras.is_chunk_close(chunk.position, near_distance_squared) {
-                        continue;
-                    }
-                    let distance_culled = !cameras
-                        .is_chunk_close(chunk.position, spawning_distance_squared + 1);
-                    let visibility_culled = !distance_culled
-                        && !cameras.is_chunk_visible_to_close_camera(
-                            chunk.position,
-                            spawning_distance_squared + 1,
-                            visibility_margin,
-                        );
-                    if distance_culled || visibility_culled {
+                    if !cameras.is_chunk_close_and_visible(
+                        chunk.position,
+                        spawning_distance_squared + 1,
+                        near_distance_squared,
+                        visibility_margin,
+                    ) {
                         marked += 1;
-                        if distance_culled {
-                            distance_culled_count += 1;
-                        } else {
-                            frustum_checks += 1;
-                            frustum_culled_count += 1;
-                        }
+                        frustum_culled_count += 1;
                         commands
                             .entity(chunk.entity)
                             .try_insert(NeedsDespawn)
@@ -847,8 +832,6 @@ where
                             chunk.position,
                             chunk.entity,
                         ));
-                    } else {
-                        frustum_checks += 1;
                     }
                 }
             }
@@ -1368,12 +1351,12 @@ impl<C: VoxelWorldConfig> TrackedCameras<C> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_empty(&self) -> bool {
         self.cameras.is_empty()
     }
 
-    #[inline]
+    #[inline(always)]
     fn camera_for_ray(&self, ray_index: usize) -> Option<&TrackedCamera> {
         match self.cameras.len() {
             0 => None,
@@ -1382,7 +1365,7 @@ impl<C: VoxelWorldConfig> TrackedCameras<C> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn for_each_unique_chunk_position(&self, mut f: impl FnMut(IVec3)) {
         let mut seen = SmallVec::<[IVec3; 2]>::new();
         for camera in &self.cameras {
@@ -1394,7 +1377,7 @@ impl<C: VoxelWorldConfig> TrackedCameras<C> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn viewport_margin_to_ndc(&self, margin: u32) -> Vec2 {
         match self.cameras.len() {
             0 => Vec2::ZERO,
@@ -1403,7 +1386,7 @@ impl<C: VoxelWorldConfig> TrackedCameras<C> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_chunk_close(&self, chunk_position: IVec3, distance_squared: i32) -> bool {
         match self.cameras.len() {
             0 => false,
@@ -1419,7 +1402,7 @@ impl<C: VoxelWorldConfig> TrackedCameras<C> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn closest_position_to_chunk(&self, chunk_position: IVec3) -> Vec3 {
         match self.cameras.len() {
             0 => Vec3::ZERO,
@@ -1428,21 +1411,46 @@ impl<C: VoxelWorldConfig> TrackedCameras<C> {
         }
     }
 
-    #[inline]
-    fn is_chunk_visible_to_close_camera(
-        &self,
-        chunk_position: IVec3,
-        distance_squared: i32,
-        ndc_margin: Vec2,
-    ) -> bool {
+    // This intentionally ignores distance. Callers pair it with their own
+    // close/protected checks so spawn and despawn share the same visibility math.
+    #[inline(always)]
+    fn is_chunk_visible(&self, chunk_position: IVec3, ndc_margin: Vec2) -> bool {
         match self.cameras.len() {
             0 => false,
             1 => self.cameras[0]
                 .visibility
                 .contains_chunk(chunk_position, ndc_margin),
             _ => self.cameras.iter().any(|camera| {
-                chunk_position.distance_squared(camera.chunk_position) <= distance_squared
-                    && camera.visibility.contains_chunk(chunk_position, ndc_margin)
+                camera.visibility.contains_chunk(chunk_position, ndc_margin)
+            }),
+        }
+    }
+
+    #[inline(always)]
+    fn is_chunk_close_and_visible(
+        &self,
+        chunk_position: IVec3,
+        distance_squared: i32,
+        protected_distance_squared: i32,
+        ndc_margin: Vec2,
+    ) -> bool {
+        match self.cameras.len() {
+            0 => false,
+            1 => camera_protects_or_sees_close_chunk(
+                &self.cameras[0],
+                chunk_position,
+                distance_squared,
+                protected_distance_squared,
+                ndc_margin,
+            ),
+            _ => self.cameras.iter().any(|camera| {
+                camera_protects_or_sees_close_chunk(
+                    camera,
+                    chunk_position,
+                    distance_squared,
+                    protected_distance_squared,
+                    ndc_margin,
+                )
             }),
         }
     }
@@ -1456,6 +1464,20 @@ fn chunk_is_close_to_any_camera(
     cameras.iter().any(|camera| {
         chunk_position.distance_squared(camera.chunk_position) <= distance_squared
     })
+}
+
+#[inline(always)]
+fn camera_protects_or_sees_close_chunk(
+    camera: &TrackedCamera,
+    chunk_position: IVec3,
+    distance_squared: i32,
+    protected_distance_squared: i32,
+    ndc_margin: Vec2,
+) -> bool {
+    let chunk_distance_squared = chunk_position.distance_squared(camera.chunk_position);
+    chunk_distance_squared <= protected_distance_squared
+        || (chunk_distance_squared <= distance_squared
+            && camera.visibility.contains_chunk(chunk_position, ndc_margin))
 }
 
 fn closest_camera_position_to_chunk(
