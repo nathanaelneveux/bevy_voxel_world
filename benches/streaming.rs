@@ -466,13 +466,15 @@ fn spawn_cameras(mut commands: Commands, world: Res<BenchWorld>) {
     });
     camera.computed.clip_from_view = projection.get_clip_from_view();
 
-    for _ in 0..world.scenario.camera_count.max(1) {
+    for camera_index in 0..world.scenario.camera_count.max(1) {
+        let position = Vec3::new(0.0, 32.0, -64.0)
+            + camera_view_offset(&world.scenario, camera_index);
         commands.spawn((
             Camera3d::default(),
             camera.clone(),
             Projection::Perspective(projection.clone()),
-            Transform::from_xyz(0.0, 32.0, -64.0)
-                .looking_at(Vec3::new(0.0, 16.0, 256.0), Vec3::Y),
+            Transform::from_translation(position)
+                .looking_at(position + Vec3::new(0.0, -16.0, 320.0), Vec3::Y),
             VoxelWorldCamera::<BenchWorld>::default(),
         ));
     }
@@ -518,11 +520,21 @@ fn drive_camera(
         }
     };
 
-    let transform =
-        Transform::from_translation(position).looking_at(position + look_offset, Vec3::Y);
-    for mut camera in cameras.iter_mut() {
-        *camera = transform;
+    for (camera_index, mut camera) in cameras.iter_mut().enumerate() {
+        let position = position + camera_view_offset(&world.scenario, camera_index);
+        *camera = Transform::from_translation(position)
+            .looking_at(position + look_offset, Vec3::Y);
     }
+}
+
+fn camera_view_offset(scenario: &BenchScenario, camera_index: usize) -> Vec3 {
+    if !scenario.name.contains("split_view") {
+        return Vec3::ZERO;
+    }
+
+    let x = (camera_index % 2) as f32;
+    let z = (camera_index / 2) as f32;
+    Vec3::new(x * 8_192.0, 0.0, z * 8_192.0)
 }
 
 fn issue_voxel_writes(
@@ -1497,6 +1509,18 @@ fn knob_scenarios() -> Vec<BenchScenario> {
         },
         BenchScenario {
             name: "multicam_same_view_4",
+            camera_count: 4,
+            spawning_rays: 512,
+            ..d128
+        },
+        BenchScenario {
+            name: "multicam_split_view_2",
+            camera_count: 2,
+            spawning_rays: 512,
+            ..d128
+        },
+        BenchScenario {
+            name: "multicam_split_view_4",
             camera_count: 4,
             spawning_rays: 512,
             ..d128
