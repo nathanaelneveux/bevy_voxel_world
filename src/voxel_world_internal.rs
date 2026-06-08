@@ -725,7 +725,11 @@ where
             chunk.lod_level = target_lod;
 
             let mut entity_commands = commands.entity(entity);
-            if cameras.is_chunk_close(chunk.position, min_despawn_distance_sq) {
+            if chunk
+                .position
+                .distance_squared(world_position_to_chunk_position(camera_position))
+                <= min_despawn_distance_sq
+            {
                 high_priority += 1;
                 entity_commands
                     .try_insert(NeedsRemesh)
