@@ -11,13 +11,15 @@ use bevy::{
     prelude::*,
     tasks::AsyncComputeTaskPool,
 };
-use futures_lite::future;
 use rand::RngExt;
 use smallvec::SmallVec;
 use std::{
     collections::VecDeque,
     marker::PhantomData,
-    sync::{Arc, RwLock, TryLockError},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex, RwLock, TryLockError,
+    },
     time::{Duration, Instant},
 };
 
@@ -80,6 +82,29 @@ pub struct VoxelWriteBuffer<C, I>(#[deref] Vec<(IVec3, WorldVoxel<I>)>, PhantomD
 pub(crate) struct NeedsMaterial<C>(PhantomData<C>);
 
 pub(crate) struct Internals<C>(PhantomData<C>);
+
+struct CompletedChunkTask<C: VoxelWorldConfig, I> {
+    id: u64,
+    task: ChunkTask<C, I>,
+}
+
+#[derive(Resource)]
+pub(crate) struct ChunkTaskCompletions<C: VoxelWorldConfig, I> {
+    sender: Sender<CompletedChunkTask<C, I>>,
+    receiver: Mutex<Receiver<CompletedChunkTask<C, I>>>,
+    next_task_id: u64,
+}
+
+impl<C: VoxelWorldConfig, I> Default for ChunkTaskCompletions<C, I> {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver: Mutex::new(receiver),
+            next_task_id: 0,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct DynamicIntervalGate {
@@ -245,6 +270,7 @@ where
         commands.init_resource::<ChunkMapRemoveBuffer<C>>();
         commands.init_resource::<MeshCache<C>>();
         commands.init_resource::<MeshCacheInsertBuffer<C>>();
+        commands.init_resource::<ChunkTaskCompletions<C, C::MaterialIndex>>();
         commands.init_resource::<ModifiedVoxels<C, C::MaterialIndex>>();
         commands.init_resource::<VoxelWriteBuffer<C, C::MaterialIndex>>();
         commands.init_resource::<VoxelWorldDiagnostics<C>>();
@@ -926,6 +952,7 @@ where
         mesh_cache: Res<MeshCache<C>>,
         modified_voxels: Res<ModifiedVoxels<C, C::MaterialIndex>>,
         chunk_map: Res<ChunkMap<C, C::MaterialIndex>>,
+        mut completed_tasks: ResMut<ChunkTaskCompletions<C, C::MaterialIndex>>,
         mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         configuration: Res<C>,
     ) {
@@ -1003,6 +1030,9 @@ where
             );
 
             let mesh_map = mesh_map.clone();
+            let completion_sender = completed_tasks.sender.clone();
+            let task_id = completed_tasks.next_task_id;
+            completed_tasks.next_task_id = completed_tasks.next_task_id.wrapping_add(1);
 
             let thread = thread_pool.spawn(async move {
                 info_span!("chunk_generate").in_scope(|| {
@@ -1014,28 +1044,30 @@ where
                 });
 
                 // No need to mesh if the chunk is empty or full
-                if chunk_task.is_empty() || chunk_task.is_full() {
-                    return chunk_task;
+                if !chunk_task.is_empty() && !chunk_task.is_full() {
+                    // Also no need to mesh if a matching mesh is already cached
+                    let mesh_cache_hit = mesh_map
+                        .read()
+                        .unwrap()
+                        .contains_key(&chunk_task.voxels_hash());
+                    if !mesh_cache_hit {
+                        info_span!("chunk_mesh").in_scope(|| {
+                            chunk_task.mesh(chunk_meshing_fn, texture_index_mapper);
+                        });
+                    }
                 }
 
-                // Also no need to mesh if a matching mesh is already cached
-                let mesh_cache_hit = mesh_map
-                    .read()
-                    .unwrap()
-                    .contains_key(&chunk_task.voxels_hash());
-                if !mesh_cache_hit {
-                    info_span!("chunk_mesh").in_scope(|| {
-                        chunk_task.mesh(chunk_meshing_fn, texture_index_mapper);
-                    });
-                }
-
-                chunk_task
+                let _ = completion_sender.send(CompletedChunkTask {
+                    id: task_id,
+                    task: chunk_task,
+                });
             });
 
             commands
                 .entity(chunk.entity)
                 .try_insert(ChunkThread::<C, C::MaterialIndex>::new(
                     thread,
+                    task_id,
                     chunk.position,
                 ))
                 .remove::<NeedsRemesh>()
@@ -1057,14 +1089,17 @@ where
     }
 
     /// Inserts new meshes for chunks that have just finished remeshing
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     pub fn spawn_meshes(
         mut commands: Commands,
         mut diagnostics: ResMut<VoxelWorldDiagnostics<C>>,
         mut chunking_threads: Query<
-            (Entity, &mut ChunkThread<C, C::MaterialIndex>, &mut Chunk<C>),
-            Without<NeedsRemesh>,
+            (&ChunkThread<C, C::MaterialIndex>, &mut Chunk<C>),
+            (Without<NeedsRemesh>, Without<NeedsDespawn>),
         >,
+        completed_tasks: Res<ChunkTaskCompletions<C, C::MaterialIndex>>,
+        configuration: Res<C>,
         mut mesh_assets: ResMut<Assets<Mesh>>,
         buffers: (
             ResMut<ChunkMapUpdateBuffer<C, C::MaterialIndex>>,
@@ -1085,19 +1120,31 @@ where
         if !loading_texture.is_loaded {
             return;
         }
+        let max_completions = configuration.max_chunk_completions_per_frame();
+        if max_completions == 0 {
+            return;
+        }
 
         let (mut chunk_map_update_buffer, mut mesh_cache_insert_buffer) = buffers;
         let mesh_handles = mesh_cache.mesh_handles();
         let user_bundles = mesh_cache.user_bundles();
 
-        for (entity, mut thread, chunk) in &mut chunking_threads {
+        let completed_receiver = completed_tasks.receiver.lock().unwrap();
+        while completed < max_completions as u64 {
+            let Ok(completed_task) = completed_receiver.try_recv() else {
+                break;
+            };
             polled += 1;
-            if !thread.0.is_finished() {
+            let chunk_task = completed_task.task;
+            let entity = chunk_task.chunk_data.entity;
+            let Ok((thread, chunk)) = chunking_threads.get_mut(entity) else {
+                continue;
+            };
+            if thread.id != completed_task.id {
                 continue;
             }
             completed += 1;
 
-            let chunk_task = future::block_on(&mut thread.0);
             let mut entity_commands = commands.entity(entity);
 
             if !chunk_task.is_empty() {

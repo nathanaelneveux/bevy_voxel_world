@@ -38,6 +38,7 @@ struct BenchScenario {
     spawning_rays: usize,
     max_spawn_per_frame: usize,
     max_active_chunk_threads: usize,
+    max_chunk_completions_per_frame: usize,
     max_chunk_despawns_per_frame: usize,
     retire_chunks_interval: Duration,
     chunk_lod_update_interval: Duration,
@@ -217,6 +218,10 @@ impl VoxelWorldConfig for BenchWorld {
 
     fn max_active_chunk_threads(&self) -> usize {
         self.scenario.max_active_chunk_threads
+    }
+
+    fn max_chunk_completions_per_frame(&self) -> usize {
+        self.scenario.max_chunk_completions_per_frame
     }
 
     fn max_chunk_despawns_per_frame(&self) -> usize {
@@ -1084,6 +1089,7 @@ fn base_fast_camera() -> BenchScenario {
         spawning_rays: 128,
         max_spawn_per_frame: 512,
         max_active_chunk_threads: 64,
+        max_chunk_completions_per_frame: usize::MAX,
         max_chunk_despawns_per_frame: usize::MAX,
         retire_chunks_interval: Duration::ZERO,
         chunk_lod_update_interval: Duration::ZERO,
@@ -1109,6 +1115,7 @@ fn distance_128_relaxed_lod() -> BenchScenario {
         spawning_rays: 384,
         max_spawn_per_frame: 2_048,
         max_active_chunk_threads: 128,
+        max_chunk_completions_per_frame: usize::MAX,
         max_chunk_despawns_per_frame: usize::MAX,
         retire_chunks_interval: Duration::ZERO,
         chunk_lod_update_interval: Duration::ZERO,
@@ -1134,6 +1141,7 @@ fn distance_128_single_voxel() -> BenchScenario {
         spawning_rays: 1_024,
         max_spawn_per_frame: 8_192,
         max_active_chunk_threads: 8_192,
+        max_chunk_completions_per_frame: usize::MAX,
         max_chunk_despawns_per_frame: usize::MAX,
         retire_chunks_interval: Duration::ZERO,
         chunk_lod_update_interval: Duration::ZERO,
@@ -1167,6 +1175,7 @@ fn mesh_cache_lifecycle(name: &'static str, world: WorldShape) -> BenchScenario 
         spawning_rays: 512,
         max_spawn_per_frame: 4_096,
         max_active_chunk_threads: 4_096,
+        max_chunk_completions_per_frame: usize::MAX,
         max_chunk_despawns_per_frame: usize::MAX,
         retire_chunks_interval: Duration::ZERO,
         chunk_lod_update_interval: Duration::ZERO,
@@ -1204,6 +1213,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 2_048,
             max_spawn_per_frame: 32_768,
             max_active_chunk_threads: 32_768,
+            max_chunk_completions_per_frame: usize::MAX,
             lod_profile: LodProfile::Off,
             ..distance_128_single_voxel()
         },
@@ -1223,6 +1233,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 256,
             max_spawn_per_frame: 2_048,
             max_active_chunk_threads: 128,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: usize::MAX,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1245,6 +1256,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 2_048,
             max_spawn_per_frame: 8_192,
             max_active_chunk_threads: 8_192,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: usize::MAX,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1267,6 +1279,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 2_048,
             max_spawn_per_frame: 8_192,
             max_active_chunk_threads: 8_192,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: usize::MAX,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1297,6 +1310,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 256,
             max_spawn_per_frame: 1_024,
             max_active_chunk_threads: 1_024,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: usize::MAX,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1319,6 +1333,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 256,
             max_spawn_per_frame: 512,
             max_active_chunk_threads: 64,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: usize::MAX,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1343,6 +1358,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 96,
             max_spawn_per_frame: 256,
             max_active_chunk_threads: 64,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: usize::MAX,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1365,6 +1381,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 128,
             max_spawn_per_frame: 512,
             max_active_chunk_threads: 64,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: usize::MAX,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1387,6 +1404,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 128,
             max_spawn_per_frame: 512,
             max_active_chunk_threads: 64,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: 256,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1411,6 +1429,7 @@ fn scenarios() -> Vec<BenchScenario> {
             spawning_rays: 128,
             max_spawn_per_frame: 512,
             max_active_chunk_threads: 128,
+            max_chunk_completions_per_frame: usize::MAX,
             max_chunk_despawns_per_frame: usize::MAX,
             retire_chunks_interval: Duration::ZERO,
             chunk_lod_update_interval: Duration::ZERO,
@@ -1440,6 +1459,7 @@ fn knob_scenarios() -> Vec<BenchScenario> {
         spawning_rays: 128,
         max_spawn_per_frame: 512,
         max_active_chunk_threads: 64,
+        max_chunk_completions_per_frame: usize::MAX,
         max_chunk_despawns_per_frame: usize::MAX,
         retire_chunks_interval: Duration::ZERO,
         chunk_lod_update_interval: Duration::ZERO,
@@ -1462,6 +1482,7 @@ fn knob_scenarios() -> Vec<BenchScenario> {
         spawning_rays: 128,
         max_spawn_per_frame: 512,
         max_active_chunk_threads: 64,
+        max_chunk_completions_per_frame: usize::MAX,
         max_chunk_despawns_per_frame: usize::MAX,
         retire_chunks_interval: Duration::ZERO,
         chunk_lod_update_interval: Duration::ZERO,
@@ -1486,6 +1507,7 @@ fn knob_scenarios() -> Vec<BenchScenario> {
         spawning_rays: 128,
         max_spawn_per_frame: 512,
         max_active_chunk_threads: 128,
+        max_chunk_completions_per_frame: usize::MAX,
         max_chunk_despawns_per_frame: usize::MAX,
         retire_chunks_interval: Duration::ZERO,
         chunk_lod_update_interval: Duration::ZERO,
@@ -1656,6 +1678,30 @@ fn knob_scenarios() -> Vec<BenchScenario> {
             ..d250
         },
         BenchScenario {
+            name: "completion_cap_d250_32_1024",
+            spawning_rays: 32,
+            max_chunk_completions_per_frame: 1_024,
+            ..d250
+        },
+        BenchScenario {
+            name: "completion_cap_d250_32_2048",
+            spawning_rays: 32,
+            max_chunk_completions_per_frame: 2_048,
+            ..d250
+        },
+        BenchScenario {
+            name: "completion_cap_d250_32_4096",
+            spawning_rays: 32,
+            max_chunk_completions_per_frame: 4_096,
+            ..d250
+        },
+        BenchScenario {
+            name: "completion_cap_d250_32_8192",
+            spawning_rays: 32,
+            max_chunk_completions_per_frame: 8_192,
+            ..d250
+        },
+        BenchScenario {
             name: "ray_sweep_d250_40",
             spawning_rays: 40,
             ..d250
@@ -1743,16 +1789,19 @@ fn knob_scenarios() -> Vec<BenchScenario> {
         BenchScenario {
             name: "chunk_threads_16",
             max_active_chunk_threads: 16,
+            max_chunk_completions_per_frame: usize::MAX,
             ..contention
         },
         BenchScenario {
             name: "chunk_threads_64",
             max_active_chunk_threads: 64,
+            max_chunk_completions_per_frame: usize::MAX,
             ..contention
         },
         BenchScenario {
             name: "chunk_threads_128",
             max_active_chunk_threads: 128,
+            max_chunk_completions_per_frame: usize::MAX,
             ..contention
         },
         BenchScenario {

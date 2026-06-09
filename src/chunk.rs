@@ -43,17 +43,22 @@ fn voxel_size_from_shape(shape: &RuntimeShape<u32, 3>) -> Vec3 {
 
 #[derive(Component)]
 #[component(storage = "SparseSet")]
-pub(crate) struct ChunkThread<C: VoxelWorldConfig, I>(
-    pub Task<ChunkTask<C, I>>,
-    PhantomData<C>,
-);
+pub(crate) struct ChunkThread<C: VoxelWorldConfig, I> {
+    pub _task: Task<()>,
+    pub id: u64,
+    _marker: PhantomData<(C, I)>,
+}
 
 impl<C, I> ChunkThread<C, I>
 where
     C: VoxelWorldConfig,
 {
-    pub fn new(task: Task<ChunkTask<C, I>>, _pos: IVec3) -> Self {
-        Self(task, PhantomData)
+    pub fn new(task: Task<()>, id: u64, _pos: IVec3) -> Self {
+        Self {
+            _task: task,
+            id,
+            _marker: PhantomData,
+        }
     }
 }
 

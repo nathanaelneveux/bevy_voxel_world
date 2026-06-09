@@ -123,6 +123,16 @@ pub trait VoxelWorldConfig: Resource + Default + Clone {
         usize::MAX
     }
 
+    /// Maximum number of completed chunk generation tasks that may be published in a single frame.
+    ///
+    /// Async generation and foreground publishing have different costs: generation happens on
+    /// Bevy's async compute pool, while publishing updates entities, meshes, events, and chunk-map
+    /// buffers on the main thread. Lower this to smooth completion spikes without reducing async
+    /// generation concurrency.
+    fn max_chunk_completions_per_frame(&self) -> usize {
+        10000
+    }
+
     /// Number of rays to cast when spawning chunks. Higher values will result in more
     /// chunks being spawned per frame, but will also increase cpu load, and can lead to
     /// thread contention.
