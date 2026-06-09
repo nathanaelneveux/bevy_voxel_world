@@ -574,9 +574,12 @@ where
                 if attach_to_root {
                     commands.entity(world_root).add_child(chunk_entity);
                 }
-                let camera_position = cameras.closest_position_to_chunk(chunk_position);
-                let lod_level =
-                    configuration.chunk_lod(chunk_position, None, camera_position);
+                let closest_camera = cameras.closest_camera_to_chunk(chunk_position);
+                let lod_level = configuration.chunk_lod(
+                    chunk_position,
+                    None,
+                    closest_camera.position,
+                );
                 let data_shape = configuration.chunk_data_shape(lod_level);
                 let mesh_shape = configuration.chunk_meshing_shape(lod_level);
                 let chunk = Chunk::<C>::new(
@@ -697,11 +700,11 @@ where
 
         for (entity, mut chunk) in chunks.iter_mut() {
             scanned += 1;
-            let camera_position = cameras.closest_position_to_chunk(chunk.position);
+            let closest_camera = cameras.closest_camera_to_chunk(chunk.position);
             let target_lod = configuration.chunk_lod(
                 chunk.position,
                 Some(chunk.lod_level),
-                camera_position,
+                closest_camera.position,
             );
             if target_lod == chunk.lod_level {
                 continue;
@@ -727,7 +730,7 @@ where
             let mut entity_commands = commands.entity(entity);
             if chunk
                 .position
-                .distance_squared(world_position_to_chunk_position(camera_position))
+                .distance_squared(closest_camera.chunk_position)
                 <= min_despawn_distance_sq
             {
                 high_priority += 1;
@@ -937,6 +940,18 @@ where
         }
 
         if max_threads == 0 {
+            return;
+        }
+
+        if available_threads == 0 {
+            if diagnostics_enabled {
+                diagnostics.frame.remesh_cap_hit = diagnostics.frame.remesh_pending_high
+                    > 0
+                    || diagnostics.frame.remesh_pending_low > 0;
+                if let Some(start) = diagnostics_start {
+                    diagnostics.frame.remesh_dirty_chunks_us = elapsed_micros(start);
+                }
+            }
             return;
         }
 
@@ -1407,11 +1422,11 @@ impl<C: VoxelWorldConfig> TrackedCameras<C> {
     }
 
     #[inline(always)]
-    fn closest_position_to_chunk(&self, chunk_position: IVec3) -> Vec3 {
+    fn closest_camera_to_chunk(&self, chunk_position: IVec3) -> &TrackedCamera {
         match self.cameras.len() {
-            0 => Vec3::ZERO,
-            1 => self.cameras[0].position,
-            _ => closest_camera_position_to_chunk(&self.cameras, chunk_position),
+            0 => unreachable!("closest_camera_to_chunk requires at least one camera"),
+            1 => &self.cameras[0],
+            _ => closest_camera_to_chunk(&self.cameras, chunk_position),
         }
     }
 
@@ -1484,20 +1499,25 @@ fn camera_protects_or_sees_close_chunk(
             && camera.visibility.contains_chunk(chunk_position, ndc_margin))
 }
 
-fn closest_camera_position_to_chunk(
+fn closest_camera_to_chunk(
     cameras: &[TrackedCamera],
     chunk_position: IVec3,
-) -> Vec3 {
+) -> &TrackedCamera {
     let chunk_world_position = chunk_position.as_vec3() * CHUNK_SIZE_F;
-    cameras
-        .iter()
-        .min_by(|a, b| {
-            a.position
-                .distance_squared(chunk_world_position)
-                .total_cmp(&b.position.distance_squared(chunk_world_position))
-        })
-        .map(|camera| camera.position)
-        .unwrap_or(Vec3::ZERO)
+    let mut closest_camera = &cameras[0];
+    let mut closest_distance_squared = closest_camera
+        .position
+        .distance_squared(chunk_world_position);
+
+    for camera in &cameras[1..] {
+        let distance_squared = camera.position.distance_squared(chunk_world_position);
+        if distance_squared < closest_distance_squared {
+            closest_camera = camera;
+            closest_distance_squared = distance_squared;
+        }
+    }
+
+    closest_camera
 }
 
 fn cameras_viewport_margin_to_ndc(cameras: &[TrackedCamera], margin: u32) -> Vec2 {
