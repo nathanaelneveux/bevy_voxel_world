@@ -943,18 +943,6 @@ where
             return;
         }
 
-        if available_threads == 0 {
-            if diagnostics_enabled {
-                diagnostics.frame.remesh_cap_hit = diagnostics.frame.remesh_pending_high
-                    > 0
-                    || diagnostics.frame.remesh_pending_low > 0;
-                if let Some(start) = diagnostics_start {
-                    diagnostics.frame.remesh_dirty_chunks_us = elapsed_micros(start);
-                }
-            }
-            return;
-        }
-
         let Some(chunk_map_read_lock) = chunk_map.try_get_read_lock() else {
             return;
         };
@@ -1527,6 +1515,7 @@ fn cameras_viewport_margin_to_ndc(cameras: &[TrackedCamera], margin: u32) -> Vec
 }
 
 const SQRT_3: f32 = 1.732_050_8;
+const CHUNK_CENTER_OFFSET: Vec3 = Vec3::splat(CHUNK_SIZE_F * 0.5);
 const CHUNK_BOUNDING_SPHERE_RADIUS: f32 = 0.5 * CHUNK_SIZE_F * SQRT_3;
 
 #[inline]
@@ -1671,8 +1660,7 @@ impl ChunkVisibilityVolume {
 
     #[inline]
     fn contains_chunk(&self, chunk_position: IVec3, ndc_margin: Vec2) -> bool {
-        let chunk_min = chunk_position.as_vec3() * CHUNK_SIZE_F;
-        let chunk_center = chunk_min + Vec3::splat(CHUNK_SIZE_F * 0.5);
+        let chunk_center = chunk_position.as_vec3() * CHUNK_SIZE_F + CHUNK_CENTER_OFFSET;
         let radius = CHUNK_BOUNDING_SPHERE_RADIUS;
 
         match self {
@@ -1692,14 +1680,15 @@ impl ChunkVisibilityVolume {
                     return false;
                 }
 
+                let projected_depth = depth.max(0.0);
                 let max_x =
-                    depth.max(0.0) * *tan_half_fov_x * (1.0 + ndc_margin.x) + radius;
+                    projected_depth * *tan_half_fov_x * (1.0 + ndc_margin.x) + radius;
                 if to_chunk.dot(*right).abs() > max_x {
                     return false;
                 }
 
                 let max_y =
-                    depth.max(0.0) * *tan_half_fov_y * (1.0 + ndc_margin.y) + radius;
+                    projected_depth * *tan_half_fov_y * (1.0 + ndc_margin.y) + radius;
                 to_chunk.dot(*up).abs() <= max_y
             }
             Self::Frustum(frustum) => {
