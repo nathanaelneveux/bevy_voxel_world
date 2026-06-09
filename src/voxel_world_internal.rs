@@ -300,13 +300,17 @@ where
         }
 
         let spawning_distance = configuration.spawning_distance() as i32;
-        let spawning_distance_squared = spawning_distance.pow(2);
+        let spawning_distance_squared = spawning_distance * spawning_distance;
         let min_despawn_distance = configuration.min_despawn_distance() as i32;
         let spawn_strategy = configuration.chunk_spawn_strategy();
         let max_spawn_per_frame = configuration.max_spawn_per_frame();
+        let spawning_rays = configuration.spawning_rays();
 
-        let visibility_margin =
-            cameras.viewport_margin_to_ndc(configuration.spawning_ray_margin());
+        let visibility_margin = if spawn_strategy == ChunkSpawnStrategy::CloseAndInView {
+            cameras.viewport_margin_to_ndc(configuration.spawning_ray_margin())
+        } else {
+            Vec2::ZERO
+        };
         let candidate_queue_limit = if max_spawn_per_frame == usize::MAX {
             usize::MAX
         } else {
@@ -317,21 +321,17 @@ where
                 max_spawn_per_frame.saturating_mul(distance_scale.saturating_sub(1));
             max_spawn_per_frame.saturating_add(
                 (max_spawn_per_frame / 4)
-                    .max(configuration.spawning_rays())
+                    .max(spawning_rays)
                     .max(distance_queue_slack),
             )
         };
         let mut spawn_ray_step_budget = if max_spawn_per_frame == usize::MAX {
             usize::MAX
         } else {
-            candidate_queue_limit
-                .saturating_mul(2)
-                .max(configuration.spawning_rays())
+            candidate_queue_limit.saturating_mul(2).max(spawning_rays)
         };
         let queue_capacity = if candidate_queue_limit == usize::MAX {
-            configuration
-                .spawning_rays()
-                .saturating_mul(spawning_distance as usize)
+            spawning_rays.saturating_mul(spawning_distance as usize)
         } else {
             candidate_queue_limit
         };
@@ -366,7 +366,7 @@ where
             ..
         } = &mut *scratch;
         let mut diagnostics_frame = VoxelWorldDiagnosticsFrame {
-            spawn_rays: configuration.spawning_rays() as u64,
+            spawn_rays: spawning_rays as u64,
             ..default()
         };
 
@@ -489,7 +489,7 @@ where
         let m = configuration.spawning_ray_margin();
         let mut rng = rand::rng();
         let collect_candidates_start = diagnostics_enabled.then(Instant::now);
-        for ray_index in 0..configuration.spawning_rays() {
+        for ray_index in 0..spawning_rays {
             if chunks_deque.len() >= candidate_queue_limit || spawn_ray_step_budget == 0 {
                 diagnostics_frame.spawn_candidate_queue_limit_hit |=
                     chunks_deque.len() >= candidate_queue_limit;
@@ -695,8 +695,8 @@ where
             return;
         }
 
-        let min_despawn_distance_sq =
-            (configuration.min_despawn_distance() as i32).pow(2);
+        let min_despawn_distance = configuration.min_despawn_distance() as i32;
+        let min_despawn_distance_sq = min_despawn_distance * min_despawn_distance;
 
         for (entity, mut chunk) in chunks.iter_mut() {
             scanned += 1;
@@ -786,17 +786,15 @@ where
         }
 
         let spawning_distance = configuration.spawning_distance() as i32;
-        let spawning_distance_squared = spawning_distance.pow(2);
-        let near_distance_squared = (configuration.min_despawn_distance() as i32).pow(2);
+        let spawning_distance_squared = spawning_distance * spawning_distance;
+        let min_despawn_distance = configuration.min_despawn_distance() as i32;
+        let near_distance_squared = min_despawn_distance * min_despawn_distance;
         let strategy = configuration.chunk_despawn_strategy();
         let mut scanned = 0;
         let mut marked = 0;
         let frustum_checks = 0;
         let mut frustum_culled_count = 0;
         let mut distance_culled_count = 0;
-
-        let visibility_margin =
-            cameras.viewport_margin_to_ndc(configuration.spawning_ray_margin());
 
         match strategy {
             ChunkDespawnStrategy::FarAway => {
@@ -820,6 +818,8 @@ where
                 }
             }
             ChunkDespawnStrategy::FarAwayOrOutOfView => {
+                let visibility_margin =
+                    cameras.viewport_margin_to_ndc(configuration.spawning_ray_margin());
                 for chunk in all_chunks.iter() {
                     scanned += 1;
                     if !cameras.is_chunk_close_and_visible(
