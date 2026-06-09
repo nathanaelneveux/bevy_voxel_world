@@ -379,7 +379,11 @@ where
             }
             return;
         };
+        let has_low_priority_chunks = !chunk_low_priority.is_empty();
         let mut promote_low_priority = |chunk_data: &ChunkData<C::MaterialIndex>| {
+            if !has_low_priority_chunks {
+                return;
+            }
             if chunk_low_priority.get(chunk_data.entity).is_ok() {
                 if let Ok(mut entity_commands) = commands.get_entity(chunk_data.entity) {
                     diagnostics_frame.spawn_low_priority_promoted += 1;
