@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    chunk::{self, ChunkData, CHUNK_SIZE_F},
+    chunk::{self, CHUNK_SIZE_F},
     configuration::VoxelWorldConfig,
     voxel::VOXEL_SIZE,
     voxel_world::ChunkWillSpawn,
@@ -19,7 +19,9 @@ use hashbrown::HashMap;
 pub struct ChunkMapData<I> {
     #[deref]
     data: HashMap<IVec3, chunk::ChunkData<I>>,
-    bounds: Aabb3d,
+    min: IVec3,
+    max: IVec3,
+    axis_counts: [HashMap<i32, usize>; 3],
 }
 
 /// Holds a map of all chunks that are currently spawned spawned
@@ -50,7 +52,10 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
     ///
     /// Expressed in **chunk coordinates**. Bounds are **inclusive**.
     pub fn get_bounds(read_lock: &RwLockReadGuard<ChunkMapData<I>>) -> Aabb3d {
-        read_lock.bounds
+        Aabb3d {
+            min: Vec3A::from(read_lock.min.as_vec3()),
+            max: Vec3A::from(read_lock.max.as_vec3()),
+        }
     }
 
     /// Get the current bounding box of loaded chunks in this map.
@@ -77,71 +82,115 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         update_buffer: &mut ChunkMapUpdateBuffer<C, I>,
         remove_buffer: &mut ChunkMapRemoveBuffer<C>,
         ev_chunk_will_spawn: &mut MessageWriter<ChunkWillSpawn<C>>,
-    ) {
+    ) -> bool {
         if insert_buffer.is_empty()
             && update_buffer.is_empty()
             && remove_buffer.is_empty()
         {
-            return;
+            return false;
         }
 
         if let Ok(mut write_lock) = self.map.try_write() {
-            for (position, chunk_data) in insert_buffer.iter() {
-                write_lock.data.insert(
-                    *position,
-                    ChunkData {
-                        position: *position,
-                        ..chunk_data.clone()
-                    },
-                );
+            write_lock.data.reserve(insert_buffer.len());
 
-                let position_f = Vec3A::from(position.as_vec3());
-                if position_f.cmplt(write_lock.bounds.min).any() {
-                    write_lock.bounds.min = position_f.min(write_lock.bounds.min);
-                } else if position_f.cmpgt(write_lock.bounds.max).any() {
-                    write_lock.bounds.max = position_f.max(write_lock.bounds.max);
+            for (position, chunk_data) in insert_buffer.drain(..) {
+                if write_lock.data.insert(position, chunk_data).is_none() {
+                    write_lock.include_position_in_bounds(position);
                 }
             }
-            insert_buffer.clear();
 
-            for (position, chunk_data, evt) in update_buffer.iter() {
-                write_lock.data.insert(
-                    *position,
-                    ChunkData {
-                        position: *position,
-                        ..chunk_data.clone()
-                    },
-                );
-
-                let position_f = Vec3A::from(position.as_vec3());
-                if position_f.cmplt(write_lock.bounds.min).any() {
-                    write_lock.bounds.min = position_f.min(write_lock.bounds.min);
-                } else if position_f.cmpgt(write_lock.bounds.max).any() {
-                    write_lock.bounds.max = position_f.max(write_lock.bounds.max);
+            for (position, chunk_data, evt) in update_buffer.drain(..) {
+                if let Some(existing_chunk_data) = write_lock.data.get_mut(&position) {
+                    *existing_chunk_data = chunk_data;
+                } else {
+                    write_lock.data.insert(position, chunk_data);
+                    write_lock.include_position_in_bounds(position);
                 }
 
-                ev_chunk_will_spawn.write((*evt).clone());
+                ev_chunk_will_spawn.write(evt);
             }
-            update_buffer.clear();
 
             let mut need_rebuild_aabb = false;
-            for position in remove_buffer.iter() {
-                write_lock.data.remove(position);
-
-                need_rebuild_aabb = write_lock.bounds.min.floor().as_ivec3() == *position
-                    || write_lock.bounds.max.floor().as_ivec3() == *position;
+            for position in remove_buffer.drain(..) {
+                if write_lock.data.remove(&position).is_some() {
+                    need_rebuild_aabb |= write_lock.remove_position(position);
+                }
             }
-            remove_buffer.clear();
 
             if need_rebuild_aabb {
-                let mut tmp_vec = Vec::with_capacity(write_lock.data.len());
-                for v in write_lock.data.keys() {
-                    tmp_vec.push(Vec3A::from(v.as_vec3()));
-                }
-                write_lock.bounds =
-                    Aabb3d::from_point_cloud(Isometry3d::IDENTITY, tmp_vec.drain(0..));
+                write_lock.rebuild_bounds_from_positions();
             }
+
+            need_rebuild_aabb
+        } else {
+            false
         }
+    }
+}
+
+impl<I> ChunkMapData<I> {
+    fn include_position_in_bounds(&mut self, position: IVec3) {
+        let first_position = self.axis_counts[0].is_empty();
+        *self.axis_counts[0].entry(position.x).or_default() += 1;
+        *self.axis_counts[1].entry(position.y).or_default() += 1;
+        *self.axis_counts[2].entry(position.z).or_default() += 1;
+
+        if first_position {
+            self.min = position;
+            self.max = position;
+            return;
+        }
+
+        self.min = self.min.min(position);
+        self.max = self.max.max(position);
+    }
+
+    fn remove_position(&mut self, position: IVec3) -> bool {
+        let boundary_removed =
+            position.cmpeq(self.min).any() || position.cmpeq(self.max).any();
+
+        Self::decrement_axis_count(&mut self.axis_counts[0], position.x);
+        Self::decrement_axis_count(&mut self.axis_counts[1], position.y);
+        Self::decrement_axis_count(&mut self.axis_counts[2], position.z);
+
+        boundary_removed
+    }
+
+    fn decrement_axis_count(axis_counts: &mut HashMap<i32, usize>, coordinate: i32) {
+        let Some(count) = axis_counts.get_mut(&coordinate) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            axis_counts.remove(&coordinate);
+        }
+    }
+
+    fn rebuild_bounds_from_positions(&mut self) {
+        let Some((min_x, max_x)) = Self::axis_bounds(&self.axis_counts[0]) else {
+            self.min = IVec3::ZERO;
+            self.max = IVec3::ZERO;
+            return;
+        };
+
+        let (min_y, max_y) = Self::axis_bounds(&self.axis_counts[1]).unwrap();
+        let (min_z, max_z) = Self::axis_bounds(&self.axis_counts[2]).unwrap();
+
+        self.min = IVec3::new(min_x, min_y, min_z);
+        self.max = IVec3::new(max_x, max_y, max_z);
+    }
+
+    fn axis_bounds(axis_counts: &HashMap<i32, usize>) -> Option<(i32, i32)> {
+        let mut coordinates = axis_counts.keys();
+        let first = *coordinates.next()?;
+        let mut min = first;
+        let mut max = first;
+        for coordinate in coordinates {
+            min = min.min(*coordinate);
+            max = max.max(*coordinate);
+        }
+
+        Some((min, max))
     }
 }
 
@@ -150,7 +199,9 @@ impl<C, I> Default for ChunkMap<C, I> {
         Self {
             map: Arc::new(RwLock::new(ChunkMapData {
                 data: HashMap::with_capacity(1000),
-                bounds: Aabb3d::new(Vec3::ZERO, Vec3::ZERO),
+                min: IVec3::ZERO,
+                max: IVec3::ZERO,
+                axis_counts: Default::default(),
             })),
             _marker: PhantomData,
         }
@@ -171,3 +222,68 @@ pub(crate) struct ChunkMapUpdateBuffer<C: VoxelWorldConfig, I>(
 
 #[derive(Resource, Deref, DerefMut, Default)]
 pub(crate) struct ChunkMapRemoveBuffer<C>(#[deref] Vec<IVec3>, PhantomData<C>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn populated_map(side: i32) -> ChunkMapData<u8> {
+        let mut map: ChunkMapData<u8> = ChunkMapData {
+            data: HashMap::new(),
+            min: IVec3::ZERO,
+            max: IVec3::ZERO,
+            axis_counts: Default::default(),
+        };
+
+        for x in 0..side {
+            for y in 0..side {
+                for z in 0..side {
+                    let position = IVec3::new(x, y, z);
+                    map.data.insert(position, chunk::ChunkData::default());
+                    map.include_position_in_bounds(position);
+                }
+            }
+        }
+
+        map
+    }
+
+    #[test]
+    fn bounds_follow_boundary_face_removal() {
+        let mut map = populated_map(4);
+        let mut needs_rebuild = false;
+
+        for y in 0..4 {
+            for z in 0..4 {
+                let position = IVec3::new(0, y, z);
+                assert!(map.data.remove(&position).is_some());
+                needs_rebuild |= map.remove_position(position);
+            }
+        }
+
+        assert!(needs_rebuild);
+        map.rebuild_bounds_from_positions();
+        assert_eq!(map.min, IVec3::new(1, 0, 0));
+        assert_eq!(map.max, IVec3::splat(3));
+    }
+
+    #[test]
+    fn bounds_reset_after_last_chunk_is_removed() {
+        let position = IVec3::new(5, -2, 7);
+        let mut map: ChunkMapData<u8> = ChunkMapData {
+            data: HashMap::from([(position, chunk::ChunkData::default())]),
+            min: IVec3::ZERO,
+            max: IVec3::ZERO,
+            axis_counts: Default::default(),
+        };
+        map.include_position_in_bounds(position);
+
+        map.data.remove(&position);
+        assert!(map.remove_position(position));
+        map.rebuild_bounds_from_positions();
+
+        assert!(map.data.is_empty());
+        assert_eq!(map.min, IVec3::ZERO);
+        assert_eq!(map.max, IVec3::ZERO);
+    }
+}
