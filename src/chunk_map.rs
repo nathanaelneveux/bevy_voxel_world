@@ -41,6 +41,13 @@ impl<C: VoxelWorldConfig, I: Copy> ChunkMap<C, I> {
         read_lock.data.get(position).cloned()
     }
 
+    pub fn get_ref<'a>(
+        position: &IVec3,
+        read_lock: &'a RwLockReadGuard<ChunkMapData<I>>,
+    ) -> Option<&'a chunk::ChunkData<I>> {
+        read_lock.data.get(position)
+    }
+
     pub fn contains_chunk(
         position: &IVec3,
         read_lock: &RwLockReadGuard<ChunkMapData<I>>,

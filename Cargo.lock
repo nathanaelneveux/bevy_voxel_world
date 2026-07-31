@@ -2356,6 +2356,7 @@ dependencies = [
  "ndshape",
  "noise",
  "rand 0.10.1",
+ "smallvec",
  "weak-table",
 ]
 
