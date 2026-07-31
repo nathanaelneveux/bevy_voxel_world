@@ -708,39 +708,54 @@ where
             return;
         }
 
+        let Some(chunk_map_read_lock) = chunk_map.try_get_read_lock() else {
+            return;
+        };
+
+        let regenerate_strategy = configuration.chunk_regenerate_strategy();
+        let voxel_lookup_delegate = configuration.voxel_lookup_delegate();
+        let chunk_meshing_delegate = configuration.chunk_meshing_delegate();
+        let texture_index_mapper = configuration.texture_index_mapper();
+        let mesh_map = mesh_cache.get_mesh_map();
+
         for chunk in dirty_chunks
             .iter()
             .chain(dirty_chunks_low.iter())
             .take(available_threads)
         {
-            let previous_chunk_data = {
-                let Some(read_lock) = chunk_map.try_get_read_lock() else {
-                    return;
-                };
-                ChunkMap::<C, C::MaterialIndex>::get(&chunk.position, &read_lock)
-            };
+            let previous_chunk_data = ChunkMap::<C, C::MaterialIndex>::get(
+                &chunk.position,
+                &chunk_map_read_lock,
+            );
 
             let lod_level = chunk.lod_level;
 
-            let regenerate_strategy = configuration.chunk_regenerate_strategy();
-
-            let voxel_data_fn = (configuration.voxel_lookup_delegate())(
+            let voxel_data_fn = voxel_lookup_delegate(
                 chunk.position,
                 lod_level,
                 previous_chunk_data.clone(),
             );
             let data_shape = chunk.data_shape;
             let mesh_shape = chunk.mesh_shape;
-            let chunk_meshing_fn = (configuration
-                .chunk_meshing_delegate()
-                .unwrap_or(Box::new(default_chunk_meshing_delegate)))(
-                chunk.position,
-                lod_level,
-                data_shape,
-                mesh_shape,
-                previous_chunk_data.clone(),
-            );
-            let texture_index_mapper = configuration.texture_index_mapper().clone();
+            let chunk_meshing_fn =
+                if let Some(chunk_meshing_delegate) = chunk_meshing_delegate.as_ref() {
+                    chunk_meshing_delegate(
+                        chunk.position,
+                        lod_level,
+                        data_shape,
+                        mesh_shape,
+                        previous_chunk_data.clone(),
+                    )
+                } else {
+                    default_chunk_meshing_delegate(
+                        chunk.position,
+                        lod_level,
+                        data_shape,
+                        mesh_shape,
+                        previous_chunk_data.clone(),
+                    )
+                };
+            let texture_index_mapper = texture_index_mapper.clone();
 
             let mut chunk_task = ChunkTask::<C, C::MaterialIndex>::new(
                 chunk.entity,
@@ -751,7 +766,7 @@ where
                 modified_voxels.clone(),
             );
 
-            let mesh_map = mesh_cache.get_mesh_map();
+            let mesh_map = mesh_map.clone();
 
             let thread = thread_pool.spawn(async move {
                 chunk_task.generate(
@@ -796,12 +811,7 @@ where
     pub fn spawn_meshes(
         mut commands: Commands,
         mut chunking_threads: Query<
-            (
-                Entity,
-                &mut ChunkThread<C, C::MaterialIndex>,
-                &mut Chunk<C>,
-                &Transform,
-            ),
+            (Entity, &mut ChunkThread<C, C::MaterialIndex>, &mut Chunk<C>),
             Without<NeedsRemesh>,
         >,
         mut mesh_assets: ResMut<Assets<Mesh>>,
@@ -818,40 +828,35 @@ where
         }
 
         let (mut chunk_map_update_buffer, mut mesh_cache_insert_buffer) = buffers;
+        let mesh_handles = mesh_cache.mesh_handles();
+        let user_bundles = mesh_cache.user_bundles();
 
-        for (entity, mut thread, chunk, transform) in &mut chunking_threads {
-            let thread_result = future::block_on(future::poll_once(&mut thread.0));
-
-            if thread_result.is_none() {
+        for (entity, mut thread, chunk) in &mut chunking_threads {
+            if !thread.0.is_finished() {
                 continue;
             }
 
-            let chunk_task = thread_result.unwrap();
+            let chunk_task = future::block_on(&mut thread.0);
+            let mut entity_commands = commands.entity(entity);
 
             if chunk_task.is_empty() || chunk_task.is_full() {
-                commands
-                    .entity(entity)
+                entity_commands
                     .remove::<Mesh3d>()
                     .remove::<MeshRef>()
                     .remove::<NeedsMaterial<C>>()
                     .remove::<C::ChunkUserBundle>();
             } else {
+                let hash = chunk_task.voxels_hash();
                 let mesh_handle = {
-                    if let Some(mesh_handle) =
-                        mesh_cache.get_mesh_handle(&chunk_task.voxels_hash())
-                    {
-                        if let Some(user_bundle) =
-                            mesh_cache.get_user_bundle(&chunk_task.voxels_hash())
-                        {
-                            commands.entity(entity).insert(user_bundle);
+                    if let Some(mesh_handle) = mesh_handles.get(&hash) {
+                        if let Some(user_bundle) = user_bundles.get(&hash).cloned() {
+                            entity_commands.insert(user_bundle);
                         }
 
                         mesh_handle
                     } else {
-                        let hash = chunk_task.voxels_hash();
                         let Some(mesh) = chunk_task.mesh else {
-                            commands
-                                .entity(chunk.entity)
+                            entity_commands
                                 .try_insert(NeedsRemesh)
                                 .remove::<NeedsRemeshLowPriority>()
                                 .remove::<ChunkThread<C, C::MaterialIndex>>();
@@ -861,8 +866,7 @@ where
                         // Bevy 0.19 mesh slab allocator can emit use-after-free
                         // errors if zero-vertex meshes are uploaded.
                         if mesh.count_vertices() == 0 {
-                            commands
-                                .entity(entity)
+                            entity_commands
                                 .remove::<Mesh3d>()
                                 .remove::<MeshRef>()
                                 .remove::<NeedsMaterial<C>>()
@@ -872,9 +876,7 @@ where
                                 chunk_task.chunk_data,
                                 ChunkWillSpawn::<C>::new(chunk_task.position, entity),
                             ));
-                            commands
-                                .entity(chunk.entity)
-                                .remove::<ChunkThread<C, C::MaterialIndex>>();
+                            entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
                             continue;
                         }
 
@@ -887,17 +889,14 @@ where
                             user_bundle.clone(),
                         ));
                         if let Some(bundle) = user_bundle {
-                            commands.entity(entity).insert(bundle);
+                            entity_commands.insert(bundle);
                         }
                         mesh_ref
                     }
                 };
 
-                commands.entity(entity).try_insert((
-                    *transform,
-                    MeshRef(mesh_handle),
-                    NeedsMaterial::<C>(PhantomData),
-                ));
+                entity_commands
+                    .try_insert((MeshRef(mesh_handle), NeedsMaterial::<C>(PhantomData)));
             }
 
             chunk_map_update_buffer.push((
@@ -906,9 +905,7 @@ where
                 ChunkWillSpawn::<C>::new(chunk_task.position, entity),
             ));
 
-            commands
-                .entity(chunk.entity)
-                .remove::<ChunkThread<C, C::MaterialIndex>>();
+            entity_commands.remove::<ChunkThread<C, C::MaterialIndex>>();
         }
     }
 
@@ -991,19 +988,18 @@ where
 
     pub(crate) fn assign_material<M: Material>(
         mut commands: Commands,
-        mut needs_material: Query<(Entity, &MeshRef, &Transform), With<NeedsMaterial<C>>>,
+        mut needs_material: Query<(Entity, &MeshRef), With<NeedsMaterial<C>>>,
         material_handle: Option<Res<VoxelWorldMaterialHandle<M>>>,
     ) {
         let Some(material_handle) = material_handle else {
             return;
         };
 
-        for (entity, mesh_ref, transform) in needs_material.iter_mut() {
+        for (entity, mesh_ref) in needs_material.iter_mut() {
             commands
                 .entity(entity)
                 .insert(Mesh3d((*mesh_ref.0).clone()))
                 .insert(MeshMaterial3d(material_handle.handle.clone()))
-                .insert(*transform)
                 .remove::<NeedsMaterial<C>>();
         }
     }
